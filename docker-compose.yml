@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  subnet-trader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: subnet-trader
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist database and logs
+      - ./data:/app/data
+      # Mount wallet directory (read-only for safety)
+      - ${BT_WALLET_PATH:-~/.bittensor/wallets}:/home/trader/.bittensor/wallets:ro
+      # Kill switch – touch ./KILL_SWITCH to halt
+      - .:/app/host:ro
+    environment:
+      - KILL_SWITCH_PATH=/app/host/KILL_SWITCH
+      - DB_PATH=/app/data/ledger.db
+      - JSONL_DIR=/app/data/logs
+    ports:
+      - "${HEALTH_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; r = httpx.get('http://localhost:8080/health'); r.raise_for_status()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
