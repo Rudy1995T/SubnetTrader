@@ -49,8 +49,21 @@ class Settings(BaseSettings):
     # ── Scheduler ──────────────────────────────────────────────────
     SCAN_INTERVAL_MIN: int = 15
 
+    # ── Fast (scalp) trading ───────────────────────────────────────
+    FAST_TRADING_ENABLED: bool = True
+    FAST_TRADING_NAV_TAO: float = 1.0   # budget separate from main strategy
+    FAST_TRADING_SLOTS: int = 2
+    FAST_TRADING_SCAN_MIN: int = 30
+    FAST_TRADING_STOP_LOSS_PCT: float = 3.0
+    FAST_TRADING_TAKE_PROFIT_PCT: float = 8.0
+    FAST_TRADING_TRAILING_STOP_PCT: float = 2.0
+    FAST_TRADING_MAX_HOLD_HOURS: float = 4.0
+    FAST_TRADING_ENTER_THRESHOLD: float = 0.48  # looser than main 0.55
+    FAST_SLOT_OFFSET: int = 10  # fast slots use slot_id 10, 11, … to avoid conflict
+
     # ── Trading / Portfolio ────────────────────────────────────────
     DRY_RUN: bool = True
+    DRY_RUN_STARTING_TAO: float = 2.0  # Simulated balance used for position sizing in dry-run mode
     NUM_SLOTS: int = 4
     MAX_HOLDING_HOURS: int = 72
     TARGET_HOLDING_HOURS: int = 48
@@ -72,13 +85,24 @@ class Settings(BaseSettings):
     VALUE_BAND_HIGH: float = 0.0050
     VALUE_BAND_DECAY: float = 0.001  # width of Gaussian decay outside band
 
-    # ── Signal weights (must sum to ~1.0 for interpretability) ─────
+    # ── Signal weights (normalised by total so any combo is valid) ──
     W_TREND: float = 0.20
     W_SUPPORT_RESISTANCE: float = 0.15
-    W_FIBONACCI: float = 0.15
+    W_FIBONACCI: float = 0.10
     W_VOLATILITY: float = 0.20
     W_MEAN_REVERSION: float = 0.15
-    W_VALUE_BAND: float = 0.15
+    W_VALUE_BAND: float = 0.10
+    W_DEREG: float = 0.10
+
+    # ── Deregistration proximity signal ────────────────────────────
+    DEREG_THRESHOLD_TAO: float = 0.0037  # approximate dereg price; update as network conditions change
+
+    # ── Correlation filter ─────────────────────────────────────────
+    CORRELATION_THRESHOLD: float = 0.85  # skip entry if corr with open position exceeds this
+
+    # ── Telegram alerts ────────────────────────────────────────────
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
 
     # ── Observability ──────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"

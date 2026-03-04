@@ -395,3 +395,34 @@ def value_band_boost(
 
     boost = math.exp(-0.5 * (distance / decay) ** 2)
     return _clamp(boost)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SIGNAL 7: Deregistration proximity boost
+# ═══════════════════════════════════════════════════════════════════
+
+def dereg_proximity_signal(
+    alpha_price: float,
+    threshold: float | None = None,
+) -> float:
+    """
+    Score subnets near (but above) the deregistration threshold higher.
+    Teams and holders often pump subnets that are close to being
+    deregistered to escape it — creating a predictable buy catalyst.
+
+    Score = 0   if price <= threshold (danger zone / already at risk)
+    Score = 1.0 if threshold < price <= threshold * 1.10 (hottest pump zone)
+    Score decays linearly to 0 as price approaches threshold * 2.0
+    Score = 0   if price > threshold * 2.0 (no dereg pressure)
+    """
+    if threshold is None:
+        threshold = settings.DEREG_THRESHOLD_TAO
+    if threshold <= 0 or alpha_price <= threshold:
+        return 0.0
+    ratio = alpha_price / threshold
+    if ratio <= 1.10:
+        return 1.0
+    if ratio >= 2.0:
+        return 0.0
+    # Linear decay: 1.0 at ratio=1.10, 0.0 at ratio=2.0
+    return _clamp(1.0 - (ratio - 1.10) / (2.0 - 1.10))

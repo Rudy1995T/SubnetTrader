@@ -108,14 +108,15 @@ class Database:
         value_band: float,
         composite: float,
         rank: int,
+        dereg: float = 0.0,
     ) -> int:
         cursor = await self.execute(
             """INSERT INTO signals
                (scan_ts, netuid, trend, support_resist, fibonacci,
-                volatility, mean_reversion, value_band, composite, rank)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                volatility, mean_reversion, value_band, dereg, composite, rank)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (scan_ts, netuid, trend, support_resist, fibonacci,
-             volatility, mean_reversion, value_band, composite, rank),
+             volatility, mean_reversion, value_band, dereg, composite, rank),
         )
         return cursor.lastrowid
 
@@ -220,11 +221,19 @@ class Database:
         exit_reason: str,
     ) -> None:
         entry = await self.fetchone(
-            "SELECT amount_tao_in FROM positions WHERE id = ?",
+            "SELECT amount_tao_in, entry_price FROM positions WHERE id = ?",
             (position_id,),
         )
-        pnl_tao = amount_tao_out - (entry["amount_tao_in"] if entry else 0.0)
-        pnl_pct = (pnl_tao / entry["amount_tao_in"] * 100) if entry and entry["amount_tao_in"] > 0 else 0.0
+        # PnL based on price change — meaningful in both DRY_RUN and LIVE mode.
+        # DRY_RUN swap amounts use a fixed fee estimate and don't reflect actual price moves.
+        entry_price = entry["entry_price"] if entry else 0.0
+        amount_tao_in = entry["amount_tao_in"] if entry else 0.0
+        if entry_price > 0 and amount_tao_in > 0:
+            pnl_pct = (exit_price - entry_price) / entry_price * 100
+            pnl_tao = amount_tao_in * pnl_pct / 100
+        else:
+            pnl_pct = 0.0
+            pnl_tao = 0.0
 
         await self.execute(
             """UPDATE positions

@@ -70,28 +70,36 @@ class SwapExecutor:
         Uses FlameWire as the endpoint.
         """
         try:
+            from bittensor_wallet import Wallet
             import bittensor as bt
 
-            wallet = bt.wallet(
+            wallet = Wallet(
                 name=settings.BT_WALLET_NAME,
                 hotkey=settings.BT_WALLET_HOTKEY,
                 path=settings.BT_WALLET_PATH,
             )
             self._wallet = wallet
 
-            # Connect substrate to FlameWire
-            self._substrate = bt.subtensor(
-                network=settings.flamewire_http_url,
-            )
-
-            logger.info(
-                "SwapExecutor initialized",
-                data={
-                    "wallet": settings.BT_WALLET_NAME,
-                    "hotkey": settings.BT_WALLET_HOTKEY,
-                    "rpc": settings.flamewire_http_url,
-                },
-            )
+            if settings.DRY_RUN:
+                # Substrate connection not needed for dry-run; all swaps are simulated
+                logger.info(
+                    "SwapExecutor initialized (DRY_RUN – substrate connection skipped)",
+                    data={"wallet": settings.BT_WALLET_NAME, "hotkey": settings.BT_WALLET_HOTKEY},
+                )
+            else:
+                # Connect substrate to FlameWire via WebSocket for live trading
+                self._substrate = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: bt.Subtensor(network=settings.flamewire_ws_url),
+                )
+                logger.info(
+                    "SwapExecutor initialized (LIVE)",
+                    data={
+                        "wallet": settings.BT_WALLET_NAME,
+                        "hotkey": settings.BT_WALLET_HOTKEY,
+                        "rpc": settings.flamewire_ws_url,
+                    },
+                )
         except ImportError:
             logger.warning(
                 "bittensor SDK not available – using RPC-only mode (quotes may be estimated)"
@@ -425,7 +433,7 @@ class SwapExecutor:
         """Get the hotkey's TAO balance."""
         if self._substrate is not None and self._wallet is not None:
             try:
-                balance = await asyncio.get_event_loop().run_in_executor(
+                balance = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: self._substrate.get_balance(self._wallet.hotkey.ss58_address),
                 )
@@ -433,7 +441,11 @@ class SwapExecutor:
             except Exception as e:
                 logger.warning(f"Failed to get balance via SDK: {e}")
 
-        # Fallback via RPC
+        # In DRY_RUN mode, return the configured starting balance for position sizing.
+        if settings.DRY_RUN:
+            return settings.DRY_RUN_STARTING_TAO
+
+        # Fallback via RPC (live mode only)
         try:
             if self._wallet is not None:
                 addr = self._wallet.hotkey.ss58_address

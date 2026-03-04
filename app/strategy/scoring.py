@@ -14,6 +14,7 @@ from app.strategy.signals import (
     volatility_breakout_signal,
     mean_reversion_signal,
     value_band_boost,
+    dereg_proximity_signal,
 )
 
 
@@ -27,6 +28,7 @@ class SubnetSignals:
     volatility: float = 0.0
     mean_reversion: float = 0.0
     value_band: float = 0.0
+    dereg: float = 0.0
     composite: float = 0.0
 
     def to_dict(self) -> dict:
@@ -38,6 +40,7 @@ class SubnetSignals:
             "volatility": round(self.volatility, 4),
             "mean_reversion": round(self.mean_reversion, 4),
             "value_band": round(self.value_band, 4),
+            "dereg": round(self.dereg, 4),
             "composite": round(self.composite, 4),
         }
 
@@ -86,8 +89,14 @@ def compute_signals(
     signals.volatility = normalize_signal(volatility_breakout_signal(prices))
     signals.mean_reversion = normalize_signal(mean_reversion_signal(prices))
     signals.value_band = normalize_signal(value_band_boost(alpha_price))
+    signals.dereg = normalize_signal(dereg_proximity_signal(alpha_price))
 
-    # Weighted composite
+    # Weighted composite (normalised by total weight so any weight combo is valid)
+    total_w = (
+        settings.W_TREND + settings.W_SUPPORT_RESISTANCE + settings.W_FIBONACCI
+        + settings.W_VOLATILITY + settings.W_MEAN_REVERSION + settings.W_VALUE_BAND
+        + settings.W_DEREG
+    ) or 1.0
     signals.composite = (
         settings.W_TREND * signals.trend
         + settings.W_SUPPORT_RESISTANCE * signals.support_resistance
@@ -95,7 +104,8 @@ def compute_signals(
         + settings.W_VOLATILITY * signals.volatility
         + settings.W_MEAN_REVERSION * signals.mean_reversion
         + settings.W_VALUE_BAND * signals.value_band
-    )
+        + settings.W_DEREG * signals.dereg
+    ) / total_w
     signals.composite = normalize_signal(signals.composite)
 
     return signals
@@ -159,6 +169,7 @@ def select_entries(
     allow_double: bool | None = None,
     current_positions: set[int] | None = None,
     cooldown_netuids: set[int] | None = None,
+    correlated_netuids: set[int] | None = None,
 ) -> list[ScoredSubnet]:
     """
     Select which subnets to enter, respecting:
@@ -166,6 +177,7 @@ def select_entries(
       - double-slot for high conviction (if enabled)
       - already-held positions
       - cooldown netuids
+      - correlation filter (skip if correlated > threshold with an open position)
     """
     if allow_double is None:
         allow_double = settings.ALLOW_DOUBLE_SLOT
@@ -173,6 +185,8 @@ def select_entries(
         current_positions = set()
     if cooldown_netuids is None:
         cooldown_netuids = set()
+    if correlated_netuids is None:
+        correlated_netuids = set()
 
     entries: list[ScoredSubnet] = []
     slots_used = 0
@@ -188,6 +202,9 @@ def select_entries(
             continue
 
         if subnet.netuid in cooldown_netuids:
+            continue
+
+        if subnet.netuid in correlated_netuids:
             continue
 
         # Determine how many slots this entry uses

@@ -12,6 +12,7 @@ from app.config import settings
 from app.chain.executor import SwapExecutor, SwapResult
 from app.data.taostats_client import TaostatsClient
 from app.logging.logger import logger
+from app.notifications.telegram import send_alert
 from app.storage.db import Database
 from app.strategy.scoring import ScoredSubnet, rank_subnets, select_entries
 from app.utils.time import utc_now, utc_iso, hours_since, parse_iso, today_midnight_utc
@@ -73,17 +74,15 @@ class PortfolioManager:
                 self._slots[sid].status = "ALPHA"
                 self._slots[sid].amount_tao = pos["amount_tao_in"]
 
-        # Initialize daily risk state
+        # Initialize daily risk state using corrected NAV estimate
         today = today_midnight_utc().strftime("%Y-%m-%d")
         nav_row = await self._db.get_daily_nav(today)
         if nav_row:
-            self._risk.start_of_day_nav = nav_row["nav_tao"]
             self._risk.trades_today = nav_row["trades_today"]
-        else:
-            # Estimate from balance
-            balance = await self._executor.get_tao_balance()
-            pos_value = sum(s.amount_tao for s in self._slots if s.status == "ALPHA")
-            self._risk.start_of_day_nav = balance + pos_value
+        # Always re-estimate start_nav using the correct cash calculation
+        # (avoids stale/incorrect values stored during previous runs)
+        start_nav, _ = await self._estimate_nav()
+        self._risk.start_of_day_nav = start_nav
 
         logger.info(
             "Portfolio initialized",
@@ -131,7 +130,7 @@ class PortfolioManager:
 
         # Drawdown check
         if self._risk.start_of_day_nav > 0:
-            current_nav = await self._estimate_nav()
+            current_nav, _ = await self._estimate_nav()
             self._risk.current_nav = current_nav
             drawdown_pct = (
                 (self._risk.start_of_day_nav - current_nav)
@@ -149,25 +148,36 @@ class PortfolioManager:
 
         return True
 
-    async def _estimate_nav(self) -> float:
-        """Estimate current NAV in TAO."""
-        tao_balance = await self._executor.get_tao_balance()
+    async def _estimate_nav(self) -> tuple[float, float]:
+        """
+        Estimate current NAV and cash in TAO.
+        Returns (nav_tao, cash_tao).
+        In DRY_RUN mode the on-chain balance never changes, so cash is
+        DRY_RUN_STARTING_TAO minus the capital deployed in open positions.
+        """
         positions_value = 0.0
+        deployed_capital = 0.0
 
         prices = await self._taostats.get_alpha_prices()
         for slot in self._slots:
             if slot.status == "ALPHA" and slot.netuid is not None:
-                # Estimate position value at current price
                 alpha_price = prices.get(slot.netuid, 0.0)
                 if slot.position_id is not None:
                     pos = await self._db.get_position(slot.position_id)
                     if pos and pos["entry_price"] > 0 and alpha_price > 0:
                         ratio = alpha_price / pos["entry_price"]
                         positions_value += pos["amount_tao_in"] * ratio
+                        deployed_capital += pos["amount_tao_in"]
                     elif pos:
                         positions_value += pos["amount_tao_in"]
+                        deployed_capital += pos["amount_tao_in"]
 
-        return tao_balance + positions_value
+        if settings.DRY_RUN:
+            tao_cash = max(0.0, settings.DRY_RUN_STARTING_TAO - deployed_capital)
+        else:
+            tao_cash = await self._executor.get_tao_balance()
+
+        return tao_cash + positions_value, tao_cash
 
     # ── Available slots ────────────────────────────────────────────
 
@@ -236,6 +246,11 @@ class PortfolioManager:
         # 3. Score and rank
         ranked = rank_subnets(subnet_data)
 
+        logger.debug(
+            f"Ranked {len(ranked)} subnets · top 5: "
+            + ", ".join(f"SN{s.netuid}({s.signals.composite:.3f})" for s in ranked[:5]),
+        )
+
         # Store signals
         for scored in ranked:
             await self._db.insert_signal(
@@ -247,6 +262,7 @@ class PortfolioManager:
                 volatility=scored.signals.volatility,
                 mean_reversion=scored.signals.mean_reversion,
                 value_band=scored.signals.value_band,
+                dereg=scored.signals.dereg,
                 composite=scored.signals.composite,
                 rank=scored.rank,
             )
@@ -259,12 +275,40 @@ class PortfolioManager:
         cooldowns = await self._db.get_active_cooldowns(utc_iso())
         free_slots = self.available_slots()
 
+        # Compute pairwise correlations and skip entries correlated with open positions
+        corr = self._compute_correlations(subnet_data)
+        occupied = self.occupied_netuids()
+        correlated: set[int] = set()
+        for (a, b), r in corr.items():
+            if abs(r) >= settings.CORRELATION_THRESHOLD:
+                if a in occupied:
+                    correlated.add(b)
+                if b in occupied:
+                    correlated.add(a)
+        if correlated:
+            logger.info(
+                "Correlation filter active",
+                data={"occupied": list(occupied), "correlated_skipped": list(correlated)},
+            )
+
         entries_to_make = select_entries(
             ranked=ranked,
             available_slots=len(free_slots),
-            current_positions=self.occupied_netuids(),
+            current_positions=occupied,
             cooldown_netuids=cooldowns,
+            correlated_netuids=correlated,
         )
+
+        if free_slots and entries_to_make:
+            logger.debug(
+                f"Entry plan: {[f'SN{e.netuid}' for e in entries_to_make]} "
+                f"into {len(free_slots)} free slot(s)",
+            )
+        elif free_slots and not entries_to_make:
+            logger.debug(
+                f"{len(free_slots)} free slot(s) but no qualifying entries "
+                f"(occupied={list(occupied)}, correlated={list(correlated)}, cooldowns={list(cooldowns)})",
+            )
 
         for entry in entries_to_make:
             result = await self._enter_position(scan_ts, entry, alpha_prices)
@@ -276,6 +320,32 @@ class PortfolioManager:
 
         logger.info("Cycle complete", data=summary)
         return summary
+
+    def _compute_correlations(
+        self, subnet_data: list[dict], min_len: int = 10
+    ) -> dict[tuple[int, int], float]:
+        """Compute Pearson correlation for each pair of subnets using their price series."""
+        import math
+        series: dict[int, list[float]] = {
+            d["netuid"]: d["prices"]
+            for d in subnet_data
+            if len(d["prices"]) >= min_len
+        }
+        netuids = list(series.keys())
+        corr: dict[tuple[int, int], float] = {}
+        for i, a in enumerate(netuids):
+            for b in netuids[i + 1:]:
+                xs, ys = series[a], series[b]
+                n = min(len(xs), len(ys))
+                xs, ys = xs[-n:], ys[-n:]
+                mx = sum(xs) / n
+                my = sum(ys) / n
+                num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+                da = math.sqrt(sum((x - mx) ** 2 for x in xs))
+                db = math.sqrt(sum((y - my) ** 2 for y in ys))
+                if da > 0 and db > 0:
+                    corr[(a, b)] = round(num / (da * db), 3)
+        return corr
 
     def _extract_prices_from_history(
         self, history: list[dict], current_price: float
@@ -329,11 +399,19 @@ class PortfolioManager:
             pos = await self._db.get_position(slot.position_id)
 
             exit_reason = self._check_exit_conditions(pos, current_price)
+            pnl_pct = (current_price / entry_price - 1) * 100
 
             if exit_reason:
+                logger.debug(f"EXIT SN{netuid} · reason={exit_reason} · PnL {pnl_pct:+.2f}%")
                 result = await self._exit_position(scan_ts, slot, pos, current_price, exit_reason)
                 if result:
                     exits.append(result)
+            else:
+                peak_price = pos.get("peak_price", entry_price)
+                drawdown_from_peak = ((peak_price - current_price) / peak_price * 100) if peak_price > 0 else 0
+                logger.debug(
+                    f"HOLD SN{netuid} · PnL {pnl_pct:+.2f}% · peak={peak_price:.7f} · dd_peak={drawdown_from_peak:.2f}%"
+                )
 
         return exits
 
@@ -446,6 +524,11 @@ class PortfolioManager:
             slot.netuid = None
             slot.amount_tao = 0.0
 
+            pnl_pct = (current_price / pos["entry_price"] - 1) * 100
+            await send_alert(
+                f"📤 <b>EXIT {reason}</b>: netuid {netuid} | "
+                f"PnL {pnl_pct:+.2f}% | {swap_result.received_tao:.4f} τ out"
+            )
             return {
                 "netuid": netuid,
                 "reason": reason,
@@ -488,12 +571,8 @@ class PortfolioManager:
         # Calculate amount: 25% of current balance / remaining slots
         tao_balance = await self._executor.get_tao_balance()
         if tao_balance <= 0:
-            # In dry-run with no real balance, use a default
-            if settings.DRY_RUN:
-                tao_balance = 10.0  # default dry-run balance
-            else:
-                logger.warning("No TAO balance available for entry")
-                return None
+            logger.warning("No TAO balance available for entry")
+            return None
 
         amount_tao = self.slot_allocation_tao(tao_balance)
         amount_tao = min(amount_tao, tao_balance * 0.95)  # keep 5% reserve
@@ -588,6 +667,10 @@ class PortfolioManager:
                 slot2.netuid = netuid
                 slot2.amount_tao = amount_tao / 2
 
+            await send_alert(
+                f"📥 <b>ENTRY</b>: netuid {netuid} | "
+                f"score {scored.score:.3f} | {amount_tao:.4f} τ in"
+            )
             return {
                 "netuid": netuid,
                 "score": scored.score,
@@ -614,8 +697,7 @@ class PortfolioManager:
     async def _update_daily_nav(self) -> None:
         """Update the daily NAV tracking record."""
         today = today_midnight_utc().strftime("%Y-%m-%d")
-        nav = await self._estimate_nav()
-        tao_cash = await self._executor.get_tao_balance()
+        nav, tao_cash = await self._estimate_nav()
         pos_value = nav - tao_cash
         trades = await self._db.count_trades_today(today)
 
@@ -634,6 +716,25 @@ class PortfolioManager:
             drawdown_pct=drawdown,
             trades_today=trades,
         )
+
+    # ── Manual close ───────────────────────────────────────────────
+
+    async def manual_close(self, position_id: int) -> dict | None:
+        """Manually close a position by its ID (e.g. user-initiated take-profit)."""
+        slot = next((s for s in self._slots if s.position_id == position_id), None)
+        if slot is None:
+            return None
+
+        pos = await self._db.get_position(position_id)
+        if pos is None:
+            return None
+
+        prices = await self._taostats.get_alpha_prices()
+        current_price = prices.get(pos["netuid"], 0.0)
+        if current_price <= 0:
+            current_price = pos["entry_price"]
+
+        return await self._exit_position(utc_iso(), slot, pos, current_price, "MANUAL")
 
     # ── Status ─────────────────────────────────────────────────────
 

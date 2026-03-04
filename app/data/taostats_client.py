@@ -36,6 +36,8 @@ class TaostatsClient:
         self._call_times: list[float] = []
         self._lock = asyncio.Lock()
         self._client: httpx.AsyncClient | None = None
+        # Per-cycle pool snapshot keyed by netuid, populated by get_subnets/get_alpha_prices
+        self._pool_snapshot: dict[int, dict] = {}
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -104,92 +106,84 @@ class TaostatsClient:
     # ── Public API methods ─────────────────────────────────────────
 
     async def get_subnets(self) -> list[dict]:
-        """Fetch all subnets metadata."""
-        data = await self._get("/api/v1/subnet/latest")
-        if isinstance(data, dict) and "subnets" in data:
-            return data["subnets"]
-        if isinstance(data, list):
-            return data
-        # Handle paginated or nested responses
-        return data.get("data", data) if isinstance(data, dict) else []
+        """Fetch all subnets metadata with current pool data."""
+        data = await self._get("/api/dtao/pool/latest/v1", params={"limit": 200})
+        items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        # Populate pool snapshot for use by get_price_history
+        self._pool_snapshot = {int(s["netuid"]): s for s in items if "netuid" in s}
+        return items
 
     async def get_subnet_info(self, netuid: int) -> dict:
-        """Fetch info for a single subnet."""
-        data = await self._get(f"/api/v1/subnet/latest", params={"netuid": netuid})
-        if isinstance(data, list) and len(data) > 0:
-            return data[0]
+        """Fetch pool info for a single subnet."""
+        if netuid in self._pool_snapshot:
+            return self._pool_snapshot[netuid]
+        data = await self._get("/api/dtao/pool/latest/v1", params={"netuid": netuid, "limit": 1})
         if isinstance(data, dict):
-            items = data.get("data", data.get("subnets", [data]))
-            if isinstance(items, list) and items:
+            items = data.get("data", [])
+            if items:
                 return items[0]
-            return data
-        return data
+        return {}
 
     async def get_alpha_prices(self) -> dict[int, float]:
         """
-        Fetch alpha token prices for all subnets.
+        Fetch alpha token prices for all subnets in one call.
+        Populates the pool snapshot so get_price_history needs no extra API calls.
         Returns {netuid: price_in_tao}.
         """
-        data = await self._get("/api/v1/subnet/latest")
+        data = await self._get("/api/dtao/pool/latest/v1", params={"limit": 200})
+        items = data.get("data", []) if isinstance(data, dict) else []
+
+        # Cache full records for get_price_history to reuse
+        self._pool_snapshot = {int(s["netuid"]): s for s in items if "netuid" in s}
+
         prices: dict[int, float] = {}
-
-        items = data
-        if isinstance(data, dict):
-            items = data.get("subnets", data.get("data", []))
-
-        for subnet in items if isinstance(items, list) else []:
+        for subnet in items:
             try:
-                netuid = int(subnet.get("netuid", subnet.get("subnet_id", -1)))
-                price = float(
-                    subnet.get("alpha_price", subnet.get("price", subnet.get("token_price", 0)))
-                )
+                netuid = int(subnet.get("netuid", -1))
+                price = float(subnet.get("price", 0) or 0)
                 if netuid >= 1 and price > 0:
                     prices[netuid] = price
             except (ValueError, TypeError):
                 continue
-
         return prices
 
     async def get_price_history(
         self, netuid: int, limit: int = 200
     ) -> list[dict]:
         """
-        Fetch historical price data for a subnet's alpha token.
-        Returns list of {timestamp, price, volume, ...} dicts.
+        Return price history for a subnet.
+        Uses seven_day_prices embedded in the pool snapshot (no extra API call).
+        Falls back to the pool/history endpoint only if snapshot is missing.
         """
-        # Try multiple endpoints that Taostats might expose
+        if netuid in self._pool_snapshot:
+            seven_day = self._pool_snapshot[netuid].get("seven_day_prices", [])
+            if seven_day:
+                return seven_day[-limit:]
+
+        # Fallback: fetch from history endpoint
         try:
             data = await self._get(
-                f"/api/v1/subnet/history",
+                "/api/dtao/pool/history/v1",
                 params={"netuid": netuid, "limit": limit},
             )
+            if isinstance(data, dict):
+                data = data.get("data", [])
+            return data if isinstance(data, list) else []
         except Exception:
-            # Fallback: try metagraph history
-            try:
-                data = await self._get(
-                    f"/api/v1/metagraph/history",
-                    params={"netuid": netuid, "limit": limit},
-                )
-            except Exception:
-                logger.warning(f"No price history available for netuid {netuid}")
-                return []
-
-        if isinstance(data, dict):
-            data = data.get("data", data.get("history", []))
-        if not isinstance(data, list):
+            logger.warning(f"No price history available for netuid {netuid}")
             return []
-        return data
 
     async def get_subnet_metrics(self, netuid: int) -> dict:
-        """Fetch subnet performance metrics."""
+        """Fetch subnet pool metrics."""
         try:
             data = await self._get(
-                f"/api/v1/subnet/metrics",
-                params={"netuid": netuid},
+                "/api/dtao/pool/latest/v1",
+                params={"netuid": netuid, "limit": 1},
             )
             if isinstance(data, dict):
-                return data.get("data", data)
-            return data if isinstance(data, dict) else {}
+                items = data.get("data", [])
+                return items[0] if items else {}
+            return {}
         except Exception:
             return {}
 
