@@ -3,8 +3,8 @@ import "./globals.css";
 import NavBar from "@/components/NavBar";
 
 export const metadata: Metadata = {
-  title: "SubnetTrader Dashboard",
-  description: "Bittensor Subnet Alpha Trading Bot",
+  title: "SubnetTrader EMA Live",
+  description: "EMA live trading control surface",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -36,8 +36,10 @@ class TaostatsClient:
         self._call_times: list[float] = []
         self._lock = asyncio.Lock()
         self._client: httpx.AsyncClient | None = None
-        # Per-cycle pool snapshot keyed by netuid, populated by get_subnets/get_alpha_prices
+        # Per-cycle pool snapshot keyed by netuid, populated by get_alpha_prices.
         self._pool_snapshot: dict[int, dict] = {}
+        # Store singleton reference so executor can access pool depth.
+        TaostatsClient._instance = self
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -105,25 +107,6 @@ class TaostatsClient:
 
     # ── Public API methods ─────────────────────────────────────────
 
-    async def get_subnets(self) -> list[dict]:
-        """Fetch all subnets metadata with current pool data."""
-        data = await self._get("/api/dtao/pool/latest/v1", params={"limit": 200})
-        items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        # Populate pool snapshot for use by get_price_history
-        self._pool_snapshot = {int(s["netuid"]): s for s in items if "netuid" in s}
-        return items
-
-    async def get_subnet_info(self, netuid: int) -> dict:
-        """Fetch pool info for a single subnet."""
-        if netuid in self._pool_snapshot:
-            return self._pool_snapshot[netuid]
-        data = await self._get("/api/dtao/pool/latest/v1", params={"netuid": netuid, "limit": 1})
-        if isinstance(data, dict):
-            items = data.get("data", [])
-            if items:
-                return items[0]
-        return {}
-
     async def get_alpha_prices(self) -> dict[int, float]:
         """
         Fetch alpha token prices for all subnets in one call.
@@ -172,21 +155,3 @@ class TaostatsClient:
         except Exception:
             logger.warning(f"No price history available for netuid {netuid}")
             return []
-
-    async def get_subnet_metrics(self, netuid: int) -> dict:
-        """Fetch subnet pool metrics."""
-        try:
-            data = await self._get(
-                "/api/dtao/pool/latest/v1",
-                params={"netuid": netuid, "limit": 1},
-            )
-            if isinstance(data, dict):
-                items = data.get("data", [])
-                return items[0] if items else {}
-            return {}
-        except Exception:
-            return {}
-
-    def invalidate_cache(self) -> None:
-        """Clear all cached data."""
-        self._cache.clear()

@@ -8,7 +8,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Set test env vars before any app imports
-os.environ.setdefault("DRY_RUN", "true")
+os.environ.setdefault("EMA_DRY_RUN", "true")
+os.environ.setdefault("EMA_DRY_RUN_STARTING_TAO", "2.0")
 os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("JSONL_DIR", "/tmp/subnet_trader_test_logs")
 os.environ.setdefault("FLAMEWIRE_API_KEY", "")
