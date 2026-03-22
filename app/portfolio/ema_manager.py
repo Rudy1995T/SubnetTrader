@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import math as _math
 from datetime import timedelta
 
-from app.config import settings
+from app.config import StrategyConfig
 from app.chain.executor import SwapExecutor
 from app.data.taostats_client import TaostatsClient
 from app.logging.logger import logger
@@ -49,10 +49,12 @@ class EmaManager:
         db: Database,
         executor: SwapExecutor,
         taostats: TaostatsClient,
+        config: StrategyConfig,
     ) -> None:
         self._db = db
         self._executor = executor
         self._taostats = taostats
+        self._cfg = config
         self._open: list[EmaPosition] = []
         self._realized_pnl: float = 0.0  # cumulative PnL from closed positions
         self._cooldowns: dict[int, datetime] = {}  # netuid → earliest re-entry time
@@ -67,7 +69,7 @@ class EmaManager:
     # ── Init ───────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
-        rows = await self._db.get_open_ema_positions()
+        rows = await self._db.get_open_ema_positions(strategy=self._cfg.tag)
         self._open = [
             EmaPosition(
                 position_id=r["id"],
@@ -87,7 +89,7 @@ class EmaManager:
         self._closing_positions = set()
         # Load realized PnL from all closed positions so it survives restarts
         try:
-            closed_rows = await self._db.get_ema_positions(limit=10000)
+            closed_rows = await self._db.get_ema_positions(limit=10000, strategy=self._cfg.tag)
             self._realized_pnl = sum(
                 r.get("pnl_tao") or 0.0
                 for r in closed_rows
@@ -96,20 +98,22 @@ class EmaManager:
         except Exception:
             self._realized_pnl = 0.0
         logger.info(
-            "EmaManager initialized",
+            f"EmaManager[{self._cfg.tag}] initialized",
             data={
+                "strategy": self._cfg.tag,
                 "open_positions": len(self._open),
-                "pot_tao": settings.EMA_POT_TAO,
-                "period": settings.EMA_PERIOD,
-                "confirm_bars": settings.EMA_CONFIRM_BARS,
+                "pot_tao": self._cfg.pot_tao,
+                "fast_period": self._cfg.fast_period,
+                "slow_period": self._cfg.slow_period,
+                "confirm_bars": self._cfg.confirm_bars,
             },
         )
 
     # ── Main cycle ─────────────────────────────────────────────────
 
-    async def run_cycle(self) -> dict:
+    async def run_cycle(self, globally_occupied: set[int] | None = None) -> dict:
         scan_ts = utc_iso()
-        summary: dict = {"scan_ts": scan_ts, "mode": "EMA", "exits": [], "entries": []}
+        summary: dict = {"scan_ts": scan_ts, "mode": "EMA", "strategy": self._cfg.tag, "exits": [], "entries": []}
 
         alpha_prices = await self._taostats.get_alpha_prices()
         if not alpha_prices:
@@ -149,7 +153,7 @@ class EmaManager:
                 pos.netuid,
                 snapshot,
                 cur,
-                timeframe_hours=settings.EMA_CANDLE_TIMEFRAME_HOURS,
+                timeframe_hours=self._cfg.candle_timeframe_hours,
             )
             reason = self._check_exit(pos, cur, prices)
             if reason:
@@ -163,7 +167,7 @@ class EmaManager:
                     await self._release_exit(pos.position_id)
 
         # 2. Circuit breaker — track pot and check for drawdown
-        current_pot = settings.EMA_POT_TAO + self._realized_pnl
+        current_pot = self._cfg.pot_tao + self._realized_pnl
         now = utc_now()
         self._pot_history.append((now, current_pot))
         # Prune entries older than 24h
@@ -176,28 +180,30 @@ class EmaManager:
             max_pot_24h = max(v for _, v in self._pot_history)
             if max_pot_24h > 0:
                 dd_pct = (max_pot_24h - current_pot) / max_pot_24h * 100
-                if dd_pct >= settings.EMA_DRAWDOWN_BREAKER_PCT and not self.is_breaker_active:
+                if dd_pct >= self._cfg.drawdown_breaker_pct and not self.is_breaker_active:
                     self._breaker_tripped_at = now
-                    logger.warning(f"EMA CIRCUIT BREAKER TRIPPED: {dd_pct:.1f}% drawdown in 24h")
+                    logger.warning(f"EMA[{self._cfg.tag}] CIRCUIT BREAKER TRIPPED: {dd_pct:.1f}% drawdown in 24h")
                     await send_alert(
-                        f"🛑 <b>EMA Circuit Breaker</b>: {dd_pct:.1f}% drawdown in 24h — "
-                        f"entries paused for {settings.EMA_DRAWDOWN_PAUSE_HOURS}h"
+                        f"🛑 <b>[{self._cfg.tag.upper()}] Circuit Breaker</b>: {dd_pct:.1f}% drawdown in 24h — "
+                        f"entries paused for {self._cfg.drawdown_pause_hours}h"
                     )
 
         # 3. Entry pass
         open_positions = await self._open_positions_snapshot()
-        slots_free = settings.EMA_MAX_POSITIONS - len(open_positions)
+        slots_free = self._cfg.max_positions - len(open_positions)
         if slots_free <= 0:
-            logger.debug("EMA: all slots occupied")
+            logger.debug(f"EMA[{self._cfg.tag}]: all slots occupied")
             logger.info("EMA cycle complete", data=summary)
             return summary
         if self.is_breaker_active:
-            logger.info("EMA: skipping entries (circuit breaker)")
+            logger.info(f"EMA[{self._cfg.tag}]: skipping entries (circuit breaker)")
             summary["entries_skipped"] = "circuit breaker"
-            logger.info("EMA cycle complete", data=summary)
+            logger.info(f"EMA[{self._cfg.tag}] cycle complete", data=summary)
             return summary
 
         occupied = {p.netuid for p in open_positions}
+        if globally_occupied:
+            occupied |= globally_occupied
 
         # Score all BUY candidates combining freshness and liquidity.
         # freshness = confirm_bars / bars_above (1.0 = just crossed, decays as bars grows)
@@ -213,40 +219,40 @@ class EmaManager:
             cur = alpha_prices.get(netuid, 0.0)
             if cur <= 0:
                 continue
-            if cur > settings.MAX_ENTRY_PRICE_TAO:
+            if cur > self._cfg.max_entry_price_tao:
                 continue
             candles = _get_completed_candles(
                 netuid,
                 snapshot,
                 cur,
-                timeframe_hours=settings.EMA_CANDLE_TIMEFRAME_HOURS,
+                timeframe_hours=self._cfg.candle_timeframe_hours,
             )
             prices = candle_close_prices(candles)
-            if len(prices) < settings.EMA_CONFIRM_BARS:
+            if len(prices) < self._cfg.confirm_bars:
                 continue
             # Dual EMA confirmation: both fast and slow must agree
-            if dual_ema_signal(prices, settings.EMA_FAST_PERIOD, settings.EMA_PERIOD, settings.EMA_CONFIRM_BARS) != "BUY":
+            if dual_ema_signal(prices, self._cfg.fast_period, self._cfg.slow_period, self._cfg.confirm_bars) != "BUY":
                 continue
-            if settings.EMA_BOUNCE_ENABLED and not bullish_ema_bounce(
+            if self._cfg.bounce_enabled and not bullish_ema_bounce(
                 candles,
-                period=settings.EMA_PERIOD,
-                touch_tolerance_pct=settings.EMA_BOUNCE_TOUCH_TOLERANCE_PCT,
-                require_green=settings.EMA_BOUNCE_REQUIRE_GREEN,
+                period=self._cfg.slow_period,
+                touch_tolerance_pct=self._cfg.bounce_touch_tolerance_pct,
+                require_green=self._cfg.bounce_require_green,
             ):
-                logger.debug(f"EMA: SN{netuid} skipped — no bullish bounce off EMA")
+                logger.debug(f"EMA[{self._cfg.tag}]: SN{netuid} skipped — no bullish bounce off EMA")
                 continue
             # Correlation guard: skip if highly correlated with an existing position
             if self._is_correlated_with_holdings(netuid, snapshot):
-                logger.debug(f"EMA: SN{netuid} skipped — correlated with existing position")
+                logger.debug(f"EMA[{self._cfg.tag}]: SN{netuid} skipped — correlated with existing position")
                 continue
             # Gini guard: skip whale-dominated subnets
             gini = await self._get_gini(netuid)
-            if gini is not None and gini > settings.EMA_MAX_GINI:
-                logger.debug(f"EMA: SN{netuid} skipped — Gini {gini:.4f} > {settings.EMA_MAX_GINI}")
+            if gini is not None and gini > self._cfg.max_gini:
+                logger.debug(f"EMA[{self._cfg.tag}]: SN{netuid} skipped — Gini {gini:.4f} > {self._cfg.max_gini}")
                 continue
-            bars = bars_above_below_ema(prices, settings.EMA_PERIOD)
-            bars = max(bars, settings.EMA_CONFIRM_BARS)  # clamp floor
-            freshness = settings.EMA_CONFIRM_BARS / bars  # 1.0 at confirm_bars, decays
+            bars = bars_above_below_ema(prices, self._cfg.slow_period)
+            bars = max(bars, self._cfg.confirm_bars)  # clamp floor
+            freshness = self._cfg.confirm_bars / bars  # 1.0 at confirm_bars, decays
             tao_in_pool = float(snap_data.get("tao_in_pool", 0) or 0)
             score = freshness * _math.log1p(tao_in_pool)
             scored.append((score, netuid, snap_data))
@@ -263,9 +269,9 @@ class EmaManager:
                     netuid,
                     snapshot,
                     cur,
-                    timeframe_hours=settings.EMA_CANDLE_TIMEFRAME_HOURS,
+                    timeframe_hours=self._cfg.candle_timeframe_hours,
                 ),
-                settings.EMA_PERIOD,
+                self._cfg.slow_period,
             )
             logger.debug(
                 f"EMA CANDIDATE SN{netuid}: score={score:.3f}, bars={bars}, "
@@ -277,13 +283,13 @@ class EmaManager:
                 occupied.add(netuid)
                 slots_free -= 1
 
-        logger.info("EMA cycle complete", data=summary)
+        logger.info(f"EMA[{self._cfg.tag}] cycle complete", data=summary)
 
         # Send balance summary to Telegram after any trades
         if summary["exits"] or summary["entries"]:
             open_positions = await self._open_positions_snapshot()
             deployed = sum(p.amount_tao for p in open_positions)
-            unstaked = max(0.0, settings.EMA_POT_TAO + self._realized_pnl - deployed)
+            unstaked = max(0.0, self._cfg.pot_tao + self._realized_pnl - deployed)
             unrealized = 0.0
             for p in open_positions:
                 cur_p = alpha_prices.get(p.netuid, p.entry_price)
@@ -292,8 +298,8 @@ class EmaManager:
             total_pnl = self._realized_pnl + unrealized
             arrow = "🟢" if total_pnl >= 0 else "🔴"
             await send_alert(
-                f"💰 <b>EMA Balance</b>\n"
-                f"Deployed: {deployed:.4f} τ ({len(self._open)}/{settings.EMA_MAX_POSITIONS} slots)\n"
+                f"💰 <b>[{self._cfg.tag.upper()}] Balance</b>\n"
+                f"Deployed: {deployed:.4f} τ ({len(self._open)}/{self._cfg.max_positions} slots)\n"
                 f"Unstaked: {unstaked:.4f} τ\n"
                 f"Realized: {self._realized_pnl:+.4f} τ\n"
                 f"Unrealized: {unrealized:+.4f} τ\n"
@@ -336,22 +342,22 @@ class EmaManager:
         """Price-only exits used by the high-frequency watcher."""
         pnl_pct = (cur - pos.entry_price) / pos.entry_price * 100.0
 
-        if pnl_pct <= -settings.EMA_STOP_LOSS_PCT:
+        if pnl_pct <= -self._cfg.stop_loss_pct:
             return "STOP_LOSS"
 
-        if pnl_pct >= settings.EMA_TAKE_PROFIT_PCT:
+        if pnl_pct >= self._cfg.take_profit_pct:
             return "TAKE_PROFIT"
 
         # Breakeven stop: once we've been up >= BREAKEVEN_TRIGGER_PCT,
         # never let the trade go negative (exit if PnL drops back to 0%)
         peak_pnl = (pos.peak_price - pos.entry_price) / pos.entry_price * 100.0
-        if peak_pnl >= settings.EMA_BREAKEVEN_TRIGGER_PCT and pnl_pct <= 0:
+        if peak_pnl >= self._cfg.breakeven_trigger_pct and pnl_pct <= 0:
             return "BREAKEVEN_STOP"
 
         # Trailing stop: once in profit, exit if price drops TRAILING_STOP_PCT from peak
         if pnl_pct > 0 and pos.peak_price > pos.entry_price:
             drawdown = (pos.peak_price - cur) / pos.peak_price * 100.0
-            if drawdown >= settings.EMA_TRAILING_STOP_PCT:
+            if drawdown >= self._cfg.trailing_stop_pct:
                 return "TRAILING_STOP"
 
         return None
@@ -363,14 +369,14 @@ class EmaManager:
 
         entry_dt = parse_iso(pos.entry_ts)
         hours_held = (utc_now() - entry_dt).total_seconds() / 3600.0
-        if hours_held >= settings.EMA_MAX_HOLDING_HOURS:
+        if hours_held >= self._cfg.max_holding_hours:
             return "TIME_STOP"
 
         if price_reason == "TRAILING_STOP":
             return price_reason
 
-        # EMA cross exit: 3 consecutive closes below EMA
-        sig = ema_signal(prices, settings.EMA_PERIOD, settings.EMA_CONFIRM_BARS)
+        # EMA cross exit: consecutive closes below EMA
+        sig = ema_signal(prices, self._cfg.slow_period, self._cfg.confirm_bars)
         if sig == "SELL":
             return "EMA_CROSS"
 
@@ -380,7 +386,7 @@ class EmaManager:
         pnl_pct = (cur - pos.entry_price) / pos.entry_price * 100.0
 
         logger.info(
-            f"EMA EXIT: netuid={pos.netuid}, reason={reason}",
+            f"EMA[{self._cfg.tag}] EXIT: netuid={pos.netuid}, reason={reason}",
             data={
                 "netuid": pos.netuid,
                 "entry_price": pos.entry_price,
@@ -395,12 +401,12 @@ class EmaManager:
                 origin_netuid=pos.netuid,
                 destination_netuid=0,
                 amount_tao=pos.amount_tao,
-                max_slippage_pct=settings.MAX_SLIPPAGE_PCT,
-                dry_run=settings.EMA_DRY_RUN,
+                max_slippage_pct=self._cfg.max_slippage_pct,
+                dry_run=self._cfg.dry_run,
                 hotkey_ss58=pos.staked_hotkey or None,
             )
         except Exception as e:
-            logger.error(f"EMA EXIT FAILED SN{pos.netuid}: {e}")
+            logger.error(f"EMA[{self._cfg.tag}] EXIT FAILED SN{pos.netuid}: {e}")
             return None
 
         if swap.success:
@@ -426,9 +432,9 @@ class EmaManager:
             self._realized_pnl += actual_pnl_tao
             async with self._state_lock:
                 self._open = [p for p in self._open if p.position_id != pos.position_id]
-                self._cooldowns[pos.netuid] = utc_now() + timedelta(hours=settings.EMA_COOLDOWN_HOURS)
+                self._cooldowns[pos.netuid] = utc_now() + timedelta(hours=self._cfg.cooldown_hours)
             await send_alert(
-                f"📉 <b>EMA EXIT {reason}</b>: SN{pos.netuid} | "
+                f"📉 <b>[{self._cfg.tag.upper()}] EXIT {reason}</b>: SN{pos.netuid} | "
                 f"PnL {actual_pnl_pct:+.2f}% ({actual_pnl_tao:+.4f} τ) | "
                 f"{swap.received_tao:.4f} τ out"
             )
@@ -444,7 +450,7 @@ class EmaManager:
     # ── Entry logic ────────────────────────────────────────────────
 
     async def _enter(self, netuid: int, cur: float, snap_data: dict) -> dict | None:
-        full_amount = round(settings.EMA_POT_TAO * settings.EMA_POSITION_SIZE_PCT, 6)
+        full_amount = round(self._cfg.pot_tao * self._cfg.position_size_pct, 6)
 
         # Adapt position size to pool depth to limit slippage.
         # For constant-product AMM: price_impact ≈ tao_in / tao_reserve.
@@ -465,7 +471,7 @@ class EmaManager:
             amount_tao = full_amount
 
         # Check actual coldkey balance before live entry
-        if not settings.EMA_DRY_RUN:
+        if not self._cfg.dry_run:
             try:
                 ck_balance = await self._executor.get_tao_balance()
                 if ck_balance < amount_tao + 0.01:
@@ -480,16 +486,16 @@ class EmaManager:
 
         # Resolve which validator hotkey to stake against on this subnet
         validator_hk: str = ""
-        if not settings.EMA_DRY_RUN:
+        if not self._cfg.dry_run:
             try:
                 validator_hk = await self._executor.get_validator_hotkey(netuid)
-                logger.info(f"EMA ENTER SN{netuid}: using validator hotkey {validator_hk}")
+                logger.info(f"EMA[{self._cfg.tag}] ENTER SN{netuid}: using validator hotkey {validator_hk}")
             except Exception as e:
-                logger.error(f"EMA SKIP ENTRY SN{netuid}: cannot resolve validator hotkey — {e}")
+                logger.error(f"EMA[{self._cfg.tag}] SKIP ENTRY SN{netuid}: cannot resolve validator hotkey — {e}")
                 return None
 
         logger.info(
-            f"EMA ENTER: netuid={netuid}",
+            f"EMA[{self._cfg.tag}] ENTER: netuid={netuid}",
             data={
                 "netuid": netuid,
                 "alpha_price": cur,
@@ -503,12 +509,12 @@ class EmaManager:
                 origin_netuid=0,
                 destination_netuid=netuid,
                 amount_tao=amount_tao,
-                max_slippage_pct=settings.MAX_SLIPPAGE_PCT,
-                dry_run=settings.EMA_DRY_RUN,
+                max_slippage_pct=self._cfg.max_slippage_pct,
+                dry_run=self._cfg.dry_run,
                 hotkey_ss58=validator_hk or None,
             )
         except Exception as e:
-            logger.error(f"EMA ENTER FAILED SN{netuid}: {e}")
+            logger.error(f"EMA[{self._cfg.tag}] ENTER FAILED SN{netuid}: {e}")
             return None
 
         if swap.success:
@@ -532,6 +538,7 @@ class EmaManager:
                 staked_hotkey=validator_hk,
                 entry_spot_price=cur,
                 entry_slippage_pct=entry_slippage_pct,
+                strategy=self._cfg.tag,
             )
             async with self._state_lock:
                 self._open.append(
@@ -548,7 +555,7 @@ class EmaManager:
                 )
             name = snap_data.get("name", "") or f"SN{netuid}"
             await send_alert(
-                f"📈 <b>EMA ENTRY</b>: {name} (SN{netuid}) | "
+                f"📈 <b>[{self._cfg.tag.upper()}] ENTRY</b>: {name} (SN{netuid}) | "
                 f"{amount_tao:.4f} τ | price {effective_price:.6f} "
                 f"(spot {cur:.6f}, slip {entry_slippage_pct:+.1f}%)"
             )
@@ -578,13 +585,13 @@ class EmaManager:
         if self._breaker_tripped_at is None:
             return False
         elapsed = (utc_now() - self._breaker_tripped_at).total_seconds() / 3600
-        return elapsed < settings.EMA_DRAWDOWN_PAUSE_HOURS
+        return elapsed < self._cfg.drawdown_pause_hours
 
     # ── Correlation guard ────────────────────────────────────────
 
     def _is_correlated_with_holdings(self, candidate_netuid: int, snapshot: dict) -> bool:
         """Return True if candidate is too correlated with any open position."""
-        threshold = settings.EMA_CORRELATION_THRESHOLD
+        threshold = self._cfg.correlation_threshold
         cand_data = snapshot.get(candidate_netuid, {})
         cand_prices = [
             float(e["price"]) for e in cand_data.get("seven_day_prices", []) if e.get("price")
@@ -614,7 +621,7 @@ class EmaManager:
 
         now = _time.time()
         cached = self._gini_cache.get(netuid)
-        if cached and (now - cached[1]) < settings.EMA_GINI_CACHE_TTL_SEC:
+        if cached and (now - cached[1]) < self._cfg.gini_cache_ttl_sec:
             return cached[0]
 
         try:
@@ -636,7 +643,7 @@ class EmaManager:
 
     def get_portfolio_summary(self, alpha_prices: dict[int, float]) -> dict:
         deployed = sum(p.amount_tao for p in self._open)
-        unstaked = max(0.0, settings.EMA_POT_TAO + self._realized_pnl - deployed)
+        unstaked = max(0.0, self._cfg.pot_tao + self._realized_pnl - deployed)
         open_positions = []
         for p in self._open:
             cur = alpha_prices.get(p.netuid, p.entry_price)
@@ -654,13 +661,16 @@ class EmaManager:
                 "entry_ts": p.entry_ts,
                 "hours_held": round(hours, 1),
             })
-        actual_pot = settings.EMA_POT_TAO + self._realized_pnl
+        actual_pot = self._cfg.pot_tao + self._realized_pnl
         return {
+            "tag": self._cfg.tag,
+            "fast_period": self._cfg.fast_period,
+            "slow_period": self._cfg.slow_period,
             "pot_tao": round(actual_pot, 6),
             "deployed_tao": round(deployed, 6),
             "unstaked_tao": round(unstaked, 6),
             "open_count": len(self._open),
-            "max_positions": settings.EMA_MAX_POSITIONS,
+            "max_positions": self._cfg.max_positions,
             "open_positions": open_positions,
             "breaker_active": self.is_breaker_active,
         }

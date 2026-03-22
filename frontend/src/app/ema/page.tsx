@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import useSWR from "swr";
 
-const API = process.env.NEXT_PUBLIC_API_URL || (typeof window !== "undefined" ? `http://${window.location.hostname}:8080` : "http://localhost:8080");
+const API = process.env.NEXT_PUBLIC_API_URL || (typeof window !== "undefined" ? `http://${window.location.hostname}:8081` : "http://localhost:8081");
 const fetcher = (url: string) => fetch(url).then((r) => r.json());
 
 interface EmaSignal {
@@ -13,7 +13,15 @@ interface EmaSignal {
   ema: number;
   fast_ema: number;
   signal: "BUY" | "SELL" | "HOLD";
+  signal_scalper?: "BUY" | "SELL" | "HOLD";
+  signal_trend?: "BUY" | "SELL" | "HOLD";
   bars: number;
+}
+
+interface StrategyInfo {
+  tag: string;
+  fast: number;
+  slow: number;
 }
 
 interface SlippageStats {
@@ -42,10 +50,12 @@ interface OpenPosition {
 
 interface PortfolioData {
   enabled: boolean;
+  tag?: string;
+  fast_period?: number;
+  slow_period?: number;
   pot_tao: number;
   deployed_tao: number;
   unstaked_tao: number;
-  wallet_balance: number | null;
   open_count: number;
   max_positions: number;
   open_positions: OpenPosition[];
@@ -62,6 +72,17 @@ interface PortfolioData {
     last_run: string | null;
     last_error: string | null;
     last_exit_count: number;
+  };
+}
+
+interface DualPortfolioData {
+  scalper: PortfolioData;
+  trend: PortfolioData;
+  combined: {
+    total_pot: number;
+    total_deployed: number;
+    total_open: number;
+    wallet_balance: number | null;
   };
 }
 
@@ -109,7 +130,7 @@ interface ExitAnimation {
   event: ExitEvent;
 }
 
-function fmt(n: number | null | undefined, decimals = 4) {
+function fmt(n: number | null | undefined, decimals = 3) {
   if (n == null) return "—";
   return n.toFixed(decimals);
 }
@@ -120,6 +141,13 @@ function fmtUsd(n: number | null | undefined, decimals = 2) {
   return `$${n.toFixed(decimals)}`;
 }
 
+function fmtUsdInline(n: number): string {
+  if (n < 0.0001) return `$${n.toFixed(8)}`;
+  if (n < 0.01) return `$${n.toFixed(6)}`;
+  if (n < 1) return `$${n.toFixed(4)}`;
+  return `$${n.toFixed(2)}`;
+}
+
 function fmtPrice(
   n: number | null | undefined,
   showUsd: boolean,
@@ -127,36 +155,35 @@ function fmtPrice(
   decimals = 6
 ): string {
   if (n == null) return "—";
+  const taoStr = `${n.toFixed(decimals)} τ`;
   if (showUsd && taoUsd) {
-    const usd = n * taoUsd;
-    if (usd < 0.0001) return `$${usd.toFixed(8)}`;
-    if (usd < 0.01) return `$${usd.toFixed(6)}`;
-    if (usd < 1) return `$${usd.toFixed(4)}`;
-    return `$${usd.toFixed(2)}`;
+    return `${taoStr} (${fmtUsdInline(n * taoUsd)})`;
   }
-  return `${n.toFixed(decimals)} τ`;
+  return taoStr;
 }
 
 function fmtTao(
   n: number | null | undefined,
   showUsd: boolean,
   taoUsd: number | null,
-  decimals = 4
+  decimals = 3
 ): string {
   if (n == null) return "—";
-  if (showUsd && taoUsd) return fmtUsd(n * taoUsd);
-  return `${n.toFixed(decimals)} τ`;
+  const taoStr = `${n.toFixed(decimals)} τ`;
+  if (showUsd && taoUsd) return `${taoStr} (${fmtUsd(n * taoUsd)})`;
+  return taoStr;
 }
 
 function fmtPnl(
   n: number,
   showUsd: boolean,
   taoUsd: number | null,
-  decimals = 4
+  decimals = 3
 ): string {
   const sign = n >= 0 ? "+" : "-";
-  if (showUsd && taoUsd) return `${sign}${fmtUsd(Math.abs(n) * taoUsd)}`;
-  return `${sign}${Math.abs(n).toFixed(decimals)} τ`;
+  const taoStr = `${sign}${Math.abs(n).toFixed(decimals)} τ`;
+  if (showUsd && taoUsd) return `${taoStr} (${sign}${fmtUsd(Math.abs(n) * taoUsd)})`;
+  return taoStr;
 }
 
 function fmtDate(iso: string | null) {
@@ -874,8 +901,98 @@ function ToastStack({
 
 // ── Main page ─────────────────────────────────────────────────
 
+function StrategyTag({ tag, dryRun }: { tag: string; dryRun: boolean }) {
+  const colors: Record<string, string> = {
+    scalper: "bg-violet-900/60 text-violet-300 border-violet-700",
+    trend: "bg-cyan-900/60 text-cyan-300 border-cyan-700",
+  };
+  const cls = colors[tag] ?? "bg-gray-800 text-gray-300 border-gray-700";
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-bold border ${cls}`}>
+      {tag.toUpperCase()}
+      {dryRun && <span className="text-gray-500 font-normal">PAPER</span>}
+    </span>
+  );
+}
+
+function StrategyCard({
+  port,
+  closed,
+  showUsd,
+  taoUsd,
+}: {
+  port: PortfolioData;
+  closed: EmaPosition[];
+  showUsd: boolean;
+  taoUsd: number | null;
+}) {
+  const tag = port.tag ?? "scalper";
+  const fast = port.fast_period ?? 3;
+  const slow = port.slow_period ?? 9;
+  const realizedPnl = closed.reduce((s, p) => s + (p.pnl_tao ?? 0), 0);
+  const wins = closed.filter((p) => (p.pnl_pct ?? 0) > 0).length;
+  const unrealizedPnl = (port.open_positions ?? []).reduce((s, p) => s + p.amount_tao * (p.pnl_pct / 100), 0);
+  const totalPnl = realizedPnl + unrealizedPnl;
+  const borderColor = tag === "scalper" ? "border-violet-800/50" : "border-cyan-800/50";
+
+  return (
+    <div className={`bg-gray-900 rounded-lg border ${borderColor} p-4`}>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <StrategyTag tag={tag} dryRun={port.dry_run} />
+          <span className="text-xs text-gray-500">EMA({fast}/{slow})</span>
+        </div>
+        {!port.dry_run ? (
+          <span className="flex items-center gap-1 text-[11px] text-emerald-400 font-semibold">
+            <span className="relative flex h-1.5 w-1.5">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-400" />
+            </span>
+            LIVE
+          </span>
+        ) : (
+          <span className="text-[11px] text-gray-500 font-semibold">PAPER</span>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-3 text-sm">
+        <div>
+          <div className="text-[11px] text-gray-500 uppercase">Pot</div>
+          <div className="font-semibold text-white">{fmtTao(port.pot_tao, showUsd, taoUsd)}</div>
+        </div>
+        <div>
+          <div className="text-[11px] text-gray-500 uppercase">Deployed</div>
+          <div className={`font-semibold ${port.deployed_tao > 0 ? "text-amber-400" : "text-white"}`}>
+            {fmtTao(port.deployed_tao, showUsd, taoUsd)}
+          </div>
+        </div>
+        <div>
+          <div className="text-[11px] text-gray-500 uppercase">Positions</div>
+          <div className="font-semibold text-white">{port.open_count} / {port.max_positions}</div>
+        </div>
+        <div>
+          <div className="text-[11px] text-gray-500 uppercase">Total PnL</div>
+          <div className={`font-semibold ${totalPnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+            {(closed.length > 0 || port.open_count > 0) ? fmtPnl(totalPnl, showUsd, taoUsd) : "—"}
+          </div>
+        </div>
+      </div>
+      {closed.length > 0 && (
+        <div className="mt-2 text-[11px] text-gray-500">
+          {wins}/{closed.length} wins · realized {fmtPnl(realizedPnl, showUsd, taoUsd)}
+        </div>
+      )}
+      {port.exit_watcher && (
+        <div className="mt-2 text-[11px] text-gray-600">
+          Exit watcher: {port.exit_watcher.enabled ? `${port.exit_watcher.interval_sec}s` : "off"}
+          {port.exit_watcher.last_run && ` · last ${fmtDate(port.exit_watcher.last_run)}`}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function EmaPage() {
-  const { data: portData, mutate: mutatePort } = useSWR<PortfolioData>(
+  const { data: dualData, mutate: mutatePort } = useSWR<DualPortfolioData>(
     `${API}/api/ema/portfolio`,
     fetcher,
     { refreshInterval: 15000 }
@@ -885,7 +1002,12 @@ export default function EmaPage() {
     fetcher,
     { refreshInterval: 15000 }
   );
-  const { data: sigData } = useSWR<{ signals: EmaSignal[]; ema_period?: number; fast_ema_period?: number }>(
+  const { data: sigData } = useSWR<{
+    signals: EmaSignal[];
+    ema_period?: number;
+    fast_ema_period?: number;
+    strategies?: StrategyInfo[];
+  }>(
     `${API}/api/ema/signals`,
     fetcher,
     { refreshInterval: 15000 }
@@ -895,10 +1017,15 @@ export default function EmaPage() {
     fetcher,
     { refreshInterval: 30000 }
   );
+  const { data: recentTradesData, mutate: mutateRecentTrades } = useSWR<{ trades: EmaPosition[] }>(
+    `${API}/api/ema/recent-trades?limit=5`,
+    fetcher,
+    { refreshInterval: 15000 }
+  );
   const [closingId, setClosingId] = useState<number | null>(null);
+  const [confirmId, setConfirmId] = useState<number | null>(null);
   const [showUsd, setShowUsd] = useState(true);
   const [clockMs, setClockMs] = useState(() => Date.now());
-  const [recentEvents, setRecentEvents] = useState<ExitEvent[]>([]);
   const [toastEvents, setToastEvents] = useState<ExitEvent[]>([]);
   const [exitAnimations, setExitAnimations] = useState<ExitAnimation[]>([]);
   const seenClosedIdsRef = useRef<Set<number>>(new Set());
@@ -911,6 +1038,15 @@ export default function EmaPage() {
     { refreshInterval: 120000 }
   );
   const taoUsd = taoUsdData?.usd ?? null;
+
+  // Derive strategy data from dual response
+  const scalper = dualData?.scalper;
+  const trend = dualData?.trend;
+  const combined = dualData?.combined;
+  const allOpenPositions = [
+    ...(scalper?.open_positions ?? []).map((p) => ({ ...p, _strategy: "scalper" as const })),
+    ...(trend?.open_positions ?? []).map((p) => ({ ...p, _strategy: "trend" as const })),
+  ];
 
   useEffect(() => {
     const timer = window.setInterval(() => setClockMs(Date.now()), 1000);
@@ -926,7 +1062,7 @@ export default function EmaPage() {
 
   useEffect(() => {
     const currentOpenMap = new Map<number, OpenPosition>(
-      (portData?.open_positions ?? []).map((pos) => [pos.position_id, pos])
+      allOpenPositions.map((pos) => [pos.position_id, pos])
     );
     const closedPositions = (posData?.positions ?? []).filter((pos) => pos.status === "CLOSED");
 
@@ -959,7 +1095,6 @@ export default function EmaPage() {
       });
 
     if (newEvents.length) {
-      setRecentEvents((prev) => [...newEvents.map((item) => item.event), ...prev].slice(0, 8));
       setToastEvents((prev) => [...newEvents.map((item) => item.event), ...prev].slice(0, 4));
 
       for (const { event, priorOpen } of newEvents) {
@@ -985,61 +1120,67 @@ export default function EmaPage() {
 
     seenClosedIdsRef.current = new Set(closedPositions.map((pos) => pos.id));
     prevOpenMapRef.current = currentOpenMap;
-  }, [portData?.open_positions, posData]);
+  }, [scalper?.open_positions, trend?.open_positions, posData]);
 
-  async function closePosition(positionId: number) {
-    if (!confirm("Close this EMA position at market price?")) return;
+  function requestClose(positionId: number) {
+    if (confirmId === positionId) {
+      executeClose(positionId);
+    } else {
+      setConfirmId(positionId);
+      setTimeout(() => setConfirmId((prev) => (prev === positionId ? null : prev)), 4000);
+    }
+  }
+
+  async function executeClose(positionId: number) {
     setClosingId(positionId);
+    setConfirmId(null);
     try {
       const res = await fetch(`${API}/api/ema/positions/${positionId}/close`, { method: "POST" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}: ${body}`);
+      }
       mutatePort();
       mutatePos();
-    } catch {
-      alert("Failed to close position");
+      mutateRecentTrades();
+    } catch (e) {
+      alert(`Failed to close position: ${e instanceof Error ? e.message : "unknown error"}`);
     } finally {
       setClosingId(null);
     }
   }
 
   const closed = (posData?.positions ?? []).filter((p) => p.status === "CLOSED");
+  const scalperClosed = closed.filter((p) => (p as any).strategy === "scalper" || !(p as any).strategy);
+  const trendClosed = closed.filter((p) => (p as any).strategy === "trend");
   const realizedPnl = closed.reduce((s, p) => s + (p.pnl_tao ?? 0), 0);
   const wins = closed.filter((p) => (p.pnl_pct ?? 0) > 0).length;
-  const unrealizedPnl = (portData?.open_positions ?? []).reduce((s, p) => {
-    return s + p.amount_tao * (p.pnl_pct / 100);
-  }, 0);
-  const alphaMarkedValueTao = (portData?.open_positions ?? []).reduce((s, p) => {
-    return s + (p.amount_alpha ?? 0) * p.current_price;
-  }, 0);
+  const unrealizedPnl = allOpenPositions.reduce((s, p) => s + p.amount_tao * (p.pnl_pct / 100), 0);
+  const alphaMarkedValueTao = allOpenPositions.reduce((s, p) => s + (p.amount_alpha ?? 0) * p.current_price, 0);
   const totalPnl = realizedPnl + unrealizedPnl;
 
-  if (!portData?.enabled && portData !== undefined) {
+  // Both strategies disabled
+  if (dualData && !scalper?.enabled && !trend?.enabled) {
     return (
       <div className="text-gray-400 text-sm">
-        EMA strategy is disabled. Set <code>EMA_ENABLED=true</code> in .env to enable it.
+        EMA strategies are disabled. Set <code>EMA_ENABLED=true</code> or <code>EMA_B_ENABLED=true</code> in .env to enable.
       </div>
     );
   }
 
-  const port = portData;
   const signals = sigData?.signals ?? [];
   const buySignals = signals.filter((s) => s.signal === "BUY").length;
   const sellSignals = signals.filter((s) => s.signal === "SELL").length;
   const holdSignals = signals.length - buySignals - sellSignals;
+  const strategies = sigData?.strategies ?? [];
 
-  const isLive = port ? !port.dry_run : false;
-  const signalTimeframeHours = port?.signal_timeframe_hours ?? 4;
-  const exitWatcher = port?.exit_watcher ?? {
-    enabled: false,
-    interval_sec: 15,
-    last_run: null,
-    last_error: null,
-    last_exit_count: 0,
-  };
+  const anyLive = (scalper && !scalper.dry_run) || (trend && !trend.dry_run);
+  const signalTimeframeHours = scalper?.signal_timeframe_hours ?? trend?.signal_timeframe_hours ?? 4;
   const nextBarClose = getNextBarClose(clockMs, signalTimeframeHours);
   const nextBarCountdown = fmtCountdown(nextBarClose, clockMs);
+
   const positionCards = [
-    ...(port?.open_positions ?? []).map((pos) => ({ kind: "active" as const, pos })),
+    ...allOpenPositions.map((pos) => ({ kind: "active" as const, pos })),
     ...exitAnimations.map((animation) => ({ kind: "exit" as const, animation })),
   ].sort((a, b) => {
     const aTs = a.kind === "active" ? a.pos.entry_ts : a.animation.position.entry_ts;
@@ -1047,13 +1188,18 @@ export default function EmaPage() {
     return new Date(bTs).getTime() - new Date(aTs).getTime();
   });
 
+  // Find the strategy config for a position (by strategy tag)
+  function strategyForPos(strategyTag: string): PortfolioData | undefined {
+    return strategyTag === "trend" ? trend ?? undefined : scalper ?? undefined;
+  }
+
   return (
     <div>
       <ToastStack events={toastEvents} showUsd={showUsd} taoUsd={taoUsd} />
       <div className="flex items-center gap-4 mb-2">
-        <h1 className="text-2xl font-bold">EMA Trend Strategy</h1>
+        <h1 className="text-2xl font-bold">Dual EMA Strategy</h1>
         <span className="text-sm text-gray-400">
-          {port ? `EMA(${port.ema_period}) · ${port.confirm_bars}-bar confirm` : ""}
+          {strategies.map((s) => `${s.tag}(${s.fast}/${s.slow})`).join(" + ")}
         </span>
         <div className="ml-auto flex items-center gap-2">
           <span className={`text-xs font-semibold ${!showUsd ? "text-white" : "text-gray-500"}`}>τ TAO</span>
@@ -1070,8 +1216,8 @@ export default function EmaPage() {
             $ USD{showUsd && taoUsd ? ` (${fmtUsd(taoUsd)}/τ)` : ""}
           </span>
         </div>
-        {port !== undefined && (
-          isLive ? (
+        {dualData !== undefined && (
+          anyLive ? (
             <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-950 border border-emerald-600 text-emerald-400 text-xs font-bold">
               <span className="relative flex h-2 w-2">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
@@ -1087,142 +1233,162 @@ export default function EmaPage() {
         )}
       </div>
       <p className="text-xs text-gray-500 mb-6">
-        Enters when price closes above EMA for{" "}
-        {port?.confirm_bars ?? 3} consecutive bars on the EMA trend filter
+        Two independent EMA strategies — Scalper (fast crosses) and Trend (longer holds) — sharing a single wallet
       </p>
 
-      {/* Pot summary */}
+      {/* Combined summary */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
         <StatCard
           label="Wallet Balance"
           value={
-            port?.wallet_balance != null
-              ? fmtTao(port.wallet_balance + alphaMarkedValueTao, showUsd, taoUsd)
+            combined?.wallet_balance != null
+              ? fmtTao(combined.wallet_balance + alphaMarkedValueTao, showUsd, taoUsd)
               : "—"
           }
           color="text-sky-400"
           sub={
-            port?.wallet_balance != null
-              ? showUsd
-                ? `${fmt(port.wallet_balance + alphaMarkedValueTao)} τ — ${fmt(port.wallet_balance)} cash · ${fmt(alphaMarkedValueTao)} alpha`
-                : `${fmtTao(port.wallet_balance, false, null)} cash · ${fmtTao(alphaMarkedValueTao, false, null)} alpha`
+            combined?.wallet_balance != null
+              ? `${fmt(combined.wallet_balance)} cash · ${fmt(alphaMarkedValueTao)} alpha`
               : undefined
           }
         />
         <StatCard
-          label="Trading Pot"
-          value={fmtTao(port?.pot_tao, showUsd, taoUsd)}
-          sub={showUsd && port?.pot_tao != null ? `${fmt(port.pot_tao)} τ` : undefined}
+          label="Total Pot"
+          value={fmtTao(combined?.total_pot, showUsd, taoUsd)}
         />
         <StatCard
-          label="Deployed"
-          value={fmtTao(port?.deployed_tao, showUsd, taoUsd)}
-          color={port && port.deployed_tao > 0 ? "text-amber-400" : "text-white"}
-          sub={showUsd && port?.deployed_tao != null ? `${fmt(port.deployed_tao)} τ` : undefined}
-        />
-        <StatCard
-          label="Unstaked"
-          value={fmtTao(port?.unstaked_tao, showUsd, taoUsd)}
-          color="text-emerald-400"
-          sub={showUsd && port?.unstaked_tao != null ? `${fmt(port.unstaked_tao)} τ` : undefined}
+          label="Total Deployed"
+          value={fmtTao(combined?.total_deployed, showUsd, taoUsd)}
+          color={combined && combined.total_deployed > 0 ? "text-amber-400" : "text-white"}
         />
         <StatCard
           label="Open Positions"
-          value={`${port?.open_count ?? 0} / ${port?.max_positions ?? 5}`}
-        />
-      </div>
-      <div className="grid grid-cols-3 gap-4 mb-8">
-        <StatCard
-          label="Realized PnL"
-          value={closed.length > 0 ? fmtPnl(realizedPnl, showUsd, taoUsd) : "—"}
-          color={realizedPnl >= 0 ? "text-emerald-400" : "text-red-400"}
-          sub={closed.length > 0
-            ? showUsd
-              ? `${fmtPnl(realizedPnl, false, null)} · ${wins}/${closed.length} wins`
-              : `${wins}/${closed.length} wins`
-            : undefined}
-        />
-        <StatCard
-          label="Unrealized PnL"
-          value={(port?.open_count ?? 0) > 0 ? fmtPnl(unrealizedPnl, showUsd, taoUsd) : "—"}
-          color={unrealizedPnl >= 0 ? "text-emerald-400" : "text-red-400"}
-          sub={(port?.open_count ?? 0) > 0
-            ? showUsd
-              ? `${fmtPnl(unrealizedPnl, false, null)} · across ${port?.open_count} positions`
-              : `across ${port?.open_count} positions`
-            : undefined}
+          value={`${combined?.total_open ?? 0} / ${(scalper?.max_positions ?? 0) + (trend?.max_positions ?? 0)}`}
         />
         <StatCard
           label="Total PnL"
           value={
-            (closed.length > 0 || (port?.open_count ?? 0) > 0)
+            (closed.length > 0 || (combined?.total_open ?? 0) > 0)
               ? fmtPnl(totalPnl, showUsd, taoUsd)
               : "—"
           }
           color={totalPnl >= 0 ? "text-emerald-400" : "text-red-400"}
           sub={
-            (closed.length > 0 || (port?.open_count ?? 0) > 0)
-              ? showUsd
-                ? `${fmtPnl(totalPnl, false, null)} · ${totalPnl >= 0 ? "▲" : "▼"} ${((totalPnl / (port?.pot_tao ?? 10)) * 100).toFixed(2)}% of pot`
-                : `${totalPnl >= 0 ? "▲" : "▼"} ${((totalPnl / (port?.pot_tao ?? 10)) * 100).toFixed(2)}% of pot`
+            (closed.length > 0 || (combined?.total_open ?? 0) > 0)
+              ? `${wins}/${closed.length} wins · ${totalPnl >= 0 ? "▲" : "▼"} ${((totalPnl / (combined?.total_pot || 20)) * 100).toFixed(2)}% of pot`
               : undefined
           }
         />
       </div>
 
-      {port && (
+      {/* Per-strategy cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+        {scalper?.enabled && <StrategyCard port={scalper} closed={scalperClosed} showUsd={showUsd} taoUsd={taoUsd} />}
+        {trend?.enabled && <StrategyCard port={trend} closed={trendClosed} showUsd={showUsd} taoUsd={taoUsd} />}
+      </div>
+
+      {/* Signal clock + rule summary */}
+      {dualData && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
           <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
             <p className="text-xs text-gray-400 mb-1">Signal Clock</p>
             <p className="text-xl font-bold text-white">{nextBarCountdown}</p>
             <p className="text-xs text-gray-500 mt-1">
-              Next 4h bar close: {fmtUtcDate(nextBarClose)}
+              Next bar close: {fmtUtcDate(nextBarClose)}
             </p>
             <p className="text-xs text-gray-600 mt-2">
               Signals only change when a full {signalTimeframeHours}h bar completes.
             </p>
           </div>
           <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
-            <p className="text-xs text-gray-400 mb-1">Exit Watcher</p>
-            <p className={`text-xl font-bold ${exitWatcher.enabled ? "text-sky-400" : "text-gray-500"}`}>
-              {exitWatcher.enabled ? `LIVE · ${exitWatcher.interval_sec}s` : "OFF"}
+            <p className="text-xs text-gray-400 mb-1">Scalper Rules</p>
+            <p className="text-sm text-white">
+              EMA({scalper?.fast_period ?? 3}/{scalper?.slow_period ?? 9}) · {scalper?.confirm_bars ?? 3}-bar confirm
             </p>
             <p className="text-xs text-gray-500 mt-1">
-              Last run: {fmtDate(exitWatcher.last_run)}
+              SL {scalper?.stop_loss_pct ?? 8}% · TP {scalper?.take_profit_pct ?? 20}% · Trail {scalper?.trailing_stop_pct ?? 5}%
             </p>
-            <p className="text-xs text-gray-600 mt-2">
-              Last cycle exits: {exitWatcher.last_exit_count}
-            </p>
-            {exitWatcher.last_error && (
-              <p className="text-xs text-red-400 mt-2">
-                Last error: {exitWatcher.last_error}
-              </p>
-            )}
           </div>
           <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
-            <p className="text-xs text-gray-400 mb-1">Rule Summary</p>
-            <p className="text-sm font-semibold text-emerald-400">
-              Buy: {port.confirm_bars} bars above EMA
+            <p className="text-xs text-gray-400 mb-1">Trend Rules</p>
+            <p className="text-sm text-white">
+              EMA({trend?.fast_period ?? 3}/{trend?.slow_period ?? 18}) · {trend?.confirm_bars ?? 3}-bar confirm
             </p>
-            <p className="text-sm font-semibold text-red-400 mt-1">
-              Sell: {port.confirm_bars} bars below EMA
-            </p>
-            <p className="text-xs text-gray-600 mt-2">
-              Price exits can still close positions between bars via live watcher checks.
+            <p className="text-xs text-gray-500 mt-1">
+              SL {trend?.stop_loss_pct ?? 8}% · TP {trend?.take_profit_pct ?? 20}% · Trail {trend?.trailing_stop_pct ?? 5}%
             </p>
           </div>
         </div>
       )}
 
-      {/* Status alerts */}
-      {(portData as any)?.breaker_active && (
+      {/* Breaker alerts */}
+      {(scalper as any)?.breaker_active && (
         <div className="mb-4 px-4 py-2 rounded-lg bg-red-950 border border-red-700 text-red-300 text-sm font-semibold">
-          🛑 Circuit breaker active — entries paused due to drawdown
+          Scalper circuit breaker active — entries paused due to drawdown
+        </div>
+      )}
+      {(trend as any)?.breaker_active && (
+        <div className="mb-4 px-4 py-2 rounded-lg bg-red-950 border border-red-700 text-red-300 text-sm font-semibold">
+          Trend circuit breaker active — entries paused due to drawdown
         </div>
       )}
 
+      {/* Recent trades */}
       <div className="mb-8">
-        <EventFeed events={recentEvents} showUsd={showUsd} taoUsd={taoUsd} />
+        <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold text-gray-300">Recent Trades</h2>
+            <span className="text-[11px] text-gray-600">last 5 from database</span>
+          </div>
+          {(recentTradesData?.trades ?? []).length > 0 ? (
+            <div className="space-y-2">
+              {(recentTradesData?.trades ?? []).map((trade) => {
+                const mood = getTradeMood(trade.pnl_pct);
+                const badgeClass =
+                  mood === "profit"
+                    ? "bg-emerald-400/10 text-emerald-300"
+                    : "bg-red-400/10 text-red-300";
+                const strat = (trade as any).strategy;
+                return (
+                  <div
+                    key={trade.id}
+                    className="flex items-center justify-between gap-3 rounded-md border border-gray-800 bg-gray-950/50 px-3 py-2"
+                  >
+                    <div>
+                      <div className="text-sm text-white">
+                        {trade.name || `SN${trade.netuid}`}
+                        <span className="ml-2 text-xs text-gray-500">#{trade.netuid}</span>
+                        {strat && (
+                          <span className={`ml-2 text-[10px] px-1.5 py-0.5 rounded font-semibold ${
+                            strat === "scalper" ? "bg-violet-900/40 text-violet-300" : "bg-cyan-900/40 text-cyan-300"
+                          }`}>{strat}</span>
+                        )}
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        {reasonLabel(trade.exit_reason)} · {fmtDate(trade.exit_ts)}
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className={`rounded-full px-2 py-1 text-[11px] font-semibold ${badgeClass}`}>
+                        {mood === "profit" ? "Profit" : "Loss"}
+                      </div>
+                      <div className={`mt-1 text-xs ${mood === "profit" ? "text-emerald-400" : "text-red-400"}`}>
+                        {trade.pnl_tao != null ? fmtPnl(trade.pnl_tao, showUsd, taoUsd, 3) : "—"}
+                        {trade.pnl_pct != null && (
+                          <span className="ml-1 opacity-75">({trade.pnl_pct >= 0 ? "+" : ""}{trade.pnl_pct.toFixed(2)}%)</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="rounded-md border border-gray-800 bg-gray-950/40 px-3 py-4 text-sm text-gray-600">
+              No closed trades yet.
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Fee analytics */}
@@ -1254,116 +1420,152 @@ export default function EmaPage() {
         </div>
       )}
 
-      {/* Open positions with charts */}
-      {port && positionCards.length > 0 && (
+      {/* Open positions with charts — split by strategy */}
+      {positionCards.length > 0 && (
         <div className="mb-10">
           <h2 className="text-lg font-semibold mb-4 text-indigo-300">
-            Open Positions ({port.open_positions.length})
+            Open Positions ({allOpenPositions.length})
             {exitAnimations.length > 0 && (
               <span className="ml-2 text-sm text-gray-500">
                 · {exitAnimations.length} closing
               </span>
             )}
           </h2>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {positionCards.map((card) => {
-              if (card.kind === "exit") {
-                return (
-                  <ExitAnimationTile
-                    key={card.animation.id}
-                    animation={card.animation}
-                    showUsd={showUsd}
-                    taoUsd={taoUsd}
-                  />
-                );
-              }
-
-              const pos = card.pos;
-              const pnlColor =
-                pos.pnl_pct >= 0 ? "text-emerald-400" : "text-red-400";
-              const pnlTao = pos.amount_tao * (pos.pnl_pct / 100);
-              const closeBtnColor = pos.pnl_pct >= 0
-                ? "border-emerald-800 text-emerald-400 hover:bg-emerald-900/30"
-                : "border-red-800 text-red-400 hover:bg-red-900/30";
-              return (
-                <div
-                  key={pos.position_id}
-                  className="bg-gray-900 border border-gray-800 rounded-lg p-4"
-                >
-                  <div className="flex justify-between items-start mb-2">
-                    <div>
-                      <span className="font-semibold text-white">
-                        {pos.name || `SN${pos.netuid}`}
-                      </span>
-                      <span className="text-gray-500 text-sm ml-2">
-                        #{pos.netuid}
-                      </span>
-                    </div>
-                    <div className="text-right">
-                      <span className={`text-lg font-bold ${pnlColor}`}>
-                        {pos.pnl_pct >= 0 ? "+" : ""}
-                        {pos.pnl_pct.toFixed(2)}%
-                      </span>
-                      <p className={`text-xs ${pnlColor} opacity-75`}>
-                        {fmtPnl(pnlTao, showUsd, taoUsd)}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Candlestick + EMA chart */}
-                  <div className="my-2 -mx-1">
-                    <CandleChart netuid={pos.netuid} entryPrice={pos.entry_price} emaPeriod={port?.ema_period ?? 18} />
-                  </div>
-                  <PositionInsight
-                    netuid={pos.netuid}
-                    entryPrice={pos.entry_price}
-                    peakPrice={pos.peak_price}
-                    fallbackCurrentPrice={pos.current_price}
-                    emaPeriod={port?.ema_period ?? 18}
-                    confirmBars={port?.confirm_bars ?? 3}
-                    stopLossPct={port?.stop_loss_pct ?? 8}
-                    takeProfitPct={port?.take_profit_pct ?? 10}
-                    trailingStopPct={port?.trailing_stop_pct ?? 10}
-                    showUsd={showUsd}
-                    taoUsd={taoUsd}
-                  />
-
-                  <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-                    <div className="text-gray-400">
-                      Entry{" "}
-                      <span className="text-white">{fmtPrice(pos.entry_price, showUsd, taoUsd)}</span>
-                    </div>
-                    <div className="text-gray-400">
-                      Current{" "}
-                      <span className="text-white">{fmtPrice(pos.current_price, showUsd, taoUsd)}</span>
-                    </div>
-                    <div className="text-gray-400">
-                      Invested{" "}
-                      <span className="text-white">{fmtTao(pos.amount_tao, showUsd, taoUsd)}</span>
-                    </div>
-                    <div className="text-gray-400">
-                      Held{" "}
-                      <span className="text-white">{pos.hours_held.toFixed(1)}h</span>
-                    </div>
-                  </div>
-                  <div className="mt-3 flex items-center justify-between">
-                    <span className="text-xs text-gray-600">
-                      Peak: {fmtPrice(pos.peak_price, showUsd, taoUsd)} · {fmtDate(pos.entry_ts)}
-                    </span>
-                    <button
-                      onClick={() => closePosition(pos.position_id)}
-                      disabled={closingId === pos.position_id}
-                      className={`px-3 py-1.5 text-xs font-semibold rounded border disabled:opacity-50 transition-colors ${closeBtnColor}`}
-                    >
-                      {closingId === pos.position_id
-                        ? "Closing..."
-                        : `Close ${fmtPnl(pnlTao, showUsd, taoUsd, 3)}`}
-                    </button>
-                  </div>
+          {(["scalper", "trend"] as const).map((stratKey) => {
+            const stratCards = positionCards.filter((card) => {
+              if (card.kind === "exit") return false;
+              return ((card.pos as any)._strategy ?? "scalper") === stratKey;
+            });
+            const stratExits = positionCards.filter((card) => {
+              if (card.kind !== "exit") return false;
+              const animStrat = (card.animation.position as any)._strategy ?? "scalper";
+              return animStrat === stratKey;
+            });
+            const allCards = [...stratCards, ...stratExits];
+            if (allCards.length === 0) return null;
+            const strat = stratKey === "trend" ? trend : scalper;
+            const borderColor = stratKey === "scalper" ? "border-violet-800/50" : "border-cyan-800/50";
+            const headerColor = stratKey === "scalper" ? "text-violet-300" : "text-cyan-300";
+            const fast = strat?.fast_period ?? 3;
+            const slow = strat?.slow_period ?? 9;
+            return (
+              <div key={stratKey} className={`mb-6 border ${borderColor} rounded-lg p-4`}>
+                <div className="flex items-center gap-2 mb-3">
+                  <StrategyTag tag={stratKey} dryRun={strat?.dry_run ?? false} />
+                  <span className={`text-sm font-medium ${headerColor}`}>
+                    EMA({fast}/{slow}) — {stratCards.length} position{stratCards.length !== 1 ? "s" : ""}
+                  </span>
                 </div>
-              );
-            })}
-          </div>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  {allCards.map((card) => {
+                    if (card.kind === "exit") {
+                      return (
+                        <ExitAnimationTile
+                          key={card.animation.id}
+                          animation={card.animation}
+                          showUsd={showUsd}
+                          taoUsd={taoUsd}
+                        />
+                      );
+                    }
+
+                    const pos = card.pos;
+                    const stratTag = (pos as any)._strategy ?? "scalper";
+                    const posStrat = strategyForPos(stratTag);
+                    const pnlColor =
+                      pos.pnl_pct >= 0 ? "text-emerald-400" : "text-red-400";
+                    const pnlTao = pos.amount_tao * (pos.pnl_pct / 100);
+                    const closeBtnColor = pos.pnl_pct >= 0
+                      ? "border-emerald-800 text-emerald-400 hover:bg-emerald-900/30"
+                      : "border-red-800 text-red-400 hover:bg-red-900/30";
+                    return (
+                      <div
+                        key={pos.position_id}
+                        className="bg-gray-900 border border-gray-800 rounded-lg p-4"
+                      >
+                        <div className="flex justify-between items-start mb-2">
+                          <div className="flex items-center gap-2">
+                            <span className="font-semibold text-white">
+                              {pos.name || `SN${pos.netuid}`}
+                            </span>
+                            <span className="text-gray-500 text-sm">
+                              #{pos.netuid}
+                            </span>
+                          </div>
+                          <div className="text-right">
+                            <span className={`text-lg font-bold ${pnlColor}`}>
+                              {pos.pnl_pct >= 0 ? "+" : ""}
+                              {pos.pnl_pct.toFixed(2)}%
+                            </span>
+                            <p className={`text-xs ${pnlColor} opacity-75`}>
+                              {fmtPnl(pnlTao, showUsd, taoUsd)}
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* Candlestick + EMA chart */}
+                        <div className="my-2 -mx-1">
+                          <CandleChart netuid={pos.netuid} entryPrice={pos.entry_price} emaPeriod={posStrat?.slow_period ?? posStrat?.ema_period ?? 9} />
+                        </div>
+                        <PositionInsight
+                          netuid={pos.netuid}
+                          entryPrice={pos.entry_price}
+                          peakPrice={pos.peak_price}
+                          fallbackCurrentPrice={pos.current_price}
+                          emaPeriod={posStrat?.slow_period ?? posStrat?.ema_period ?? 9}
+                          confirmBars={posStrat?.confirm_bars ?? 3}
+                          stopLossPct={posStrat?.stop_loss_pct ?? 8}
+                          takeProfitPct={posStrat?.take_profit_pct ?? 10}
+                          trailingStopPct={posStrat?.trailing_stop_pct ?? 10}
+                          showUsd={showUsd}
+                          taoUsd={taoUsd}
+                        />
+
+                        <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+                          <div className="text-gray-400">
+                            Entry{" "}
+                            <span className="text-white">{fmtPrice(pos.entry_price, showUsd, taoUsd)}</span>
+                          </div>
+                          <div className="text-gray-400">
+                            Current{" "}
+                            <span className="text-white">{fmtPrice(pos.current_price, showUsd, taoUsd)}</span>
+                          </div>
+                          <div className="text-gray-400">
+                            Invested{" "}
+                            <span className="text-white">{fmtTao(pos.amount_tao, showUsd, taoUsd)}</span>
+                          </div>
+                          <div className="text-gray-400">
+                            Held{" "}
+                            <span className="text-white">{pos.hours_held.toFixed(1)}h</span>
+                          </div>
+                        </div>
+                        <div className="mt-3 flex items-center justify-between">
+                          <span className="text-xs text-gray-600">
+                            Peak: {fmtPrice(pos.peak_price, showUsd, taoUsd)} · {fmtDate(pos.entry_ts)}
+                          </span>
+                          <button
+                            onClick={() => requestClose(pos.position_id)}
+                            disabled={closingId === pos.position_id}
+                            className={`px-3 py-1.5 text-xs font-semibold rounded border disabled:opacity-50 transition-colors ${
+                              confirmId === pos.position_id
+                                ? "border-red-500 bg-red-900/50 text-red-300 animate-pulse"
+                                : closeBtnColor
+                            }`}
+                          >
+                            {closingId === pos.position_id
+                              ? "Closing..."
+                              : confirmId === pos.position_id
+                              ? "Tap again to confirm"
+                              : `Close ${fmtPnl(pnlTao, showUsd, taoUsd, 3)}`}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -1378,10 +1580,17 @@ export default function EmaPage() {
               <tr className="text-gray-400 text-left border-b border-gray-800">
                 <th className="pb-2 pr-4">Subnet</th>
                 <th className="pb-2 pr-4">Price {showUsd ? "(USD)" : "(τ)"}</th>
-                <th className="pb-2 pr-4">EMA({port?.ema_period ?? 18}) {showUsd ? "(USD)" : "(τ)"}</th>
-                <th className="pb-2 pr-4">Fast({sigData?.fast_ema_period ?? 6})</th>
+                <th className="pb-2 pr-4">EMA({sigData?.ema_period ?? 9})</th>
+                <th className="pb-2 pr-4">Fast({sigData?.fast_ema_period ?? 3})</th>
                 <th className="pb-2 pr-4">% vs EMA</th>
-                <th className="pb-2 pr-4">Signal</th>
+                {strategies.length > 1 ? (
+                  <>
+                    <th className="pb-2 pr-4">Scalper</th>
+                    <th className="pb-2 pr-4">Trend</th>
+                  </>
+                ) : (
+                  <th className="pb-2 pr-4">Signal</th>
+                )}
                 <th className="pb-2">Bars</th>
               </tr>
             </thead>
@@ -1425,9 +1634,20 @@ export default function EmaPage() {
                       {pctVsEma >= 0 ? "+" : ""}
                       {pctVsEma.toFixed(2)}%
                     </td>
-                    <td className="py-2 pr-4">
-                      <SignalBadge signal={s.signal} />
-                    </td>
+                    {strategies.length > 1 ? (
+                      <>
+                        <td className="py-2 pr-4">
+                          <SignalBadge signal={s.signal_scalper ?? s.signal} />
+                        </td>
+                        <td className="py-2 pr-4">
+                          <SignalBadge signal={s.signal_trend ?? s.signal} />
+                        </td>
+                      </>
+                    ) : (
+                      <td className="py-2 pr-4">
+                        <SignalBadge signal={s.signal} />
+                      </td>
+                    )}
                     <td className={`py-2 font-mono ${barColor}`}>
                       {s.bars > 0 ? `+${s.bars}` : s.bars}
                     </td>
@@ -1450,6 +1670,7 @@ export default function EmaPage() {
               <thead>
                 <tr className="text-gray-400 text-left border-b border-gray-800">
                   <th className="pb-2 pr-4">Subnet</th>
+                  <th className="pb-2 pr-4">Strategy</th>
                   <th className="pb-2 pr-4">Entry</th>
                   <th className="pb-2 pr-4">Exit</th>
                   <th className="pb-2 pr-4">Entry Price {showUsd ? "(USD)" : "(τ)"}</th>
@@ -1472,6 +1693,7 @@ export default function EmaPage() {
                       : p.exit_reason === "MANUAL_CLOSE"
                       ? "text-amber-400"
                       : "text-gray-400";
+                  const strat = (p as any).strategy;
                   return (
                     <tr
                       key={p.id}
@@ -1481,6 +1703,13 @@ export default function EmaPage() {
                         <span className="font-medium text-white">
                           {p.name || `SN${p.netuid}`}
                         </span>
+                      </td>
+                      <td className="py-2 pr-4">
+                        {strat && (
+                          <span className={`text-[11px] px-1.5 py-0.5 rounded font-semibold ${
+                            strat === "scalper" ? "bg-violet-900/40 text-violet-300" : "bg-cyan-900/40 text-cyan-300"
+                          }`}>{strat}</span>
+                        )}
                       </td>
                       <td className="py-2 pr-4 text-gray-400 text-xs">
                         {fmtDate(p.entry_ts)}
@@ -1516,7 +1745,7 @@ export default function EmaPage() {
         </div>
       )}
 
-      {closed.length === 0 && port?.open_count === 0 && (
+      {closed.length === 0 && (combined?.total_open ?? 0) === 0 && (
         <p className="text-gray-500 text-sm mt-4">
           No EMA trades yet. Signals will trigger entries on the next scan cycle.
         </p>

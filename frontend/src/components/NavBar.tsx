@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import useSWR from "swr";
 
-const API = process.env.NEXT_PUBLIC_API_URL || (typeof window !== "undefined" ? `http://${window.location.hostname}:8080` : "http://localhost:8080");
+const API = process.env.NEXT_PUBLIC_API_URL || (typeof window !== "undefined" ? `http://${window.location.hostname}:8081` : "http://localhost:8081");
 const fetcher = (url: string) => fetch(url).then((r) => r.json());
 
 interface ControlStatus {
@@ -14,6 +14,7 @@ interface ControlStatus {
 const links = [
   { href: "/ema", label: "EMA" },
   { href: "/control", label: "Control" },
+  { href: "/settings", label: "\u2699 Settings" },
 ];
 
 export default function NavBar() {

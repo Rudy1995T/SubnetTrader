@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import NavBar from "@/components/NavBar";
+import ConditionalNav from "@/components/ConditionalNav";
 
 export const metadata: Metadata = {
   title: "SubnetTrader EMA Live",
@@ -11,7 +11,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body className="min-h-screen">
-        <NavBar />
+        <ConditionalNav />
         <main className="p-6">{children}</main>
       </body>
     </html>

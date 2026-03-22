@@ -45,12 +45,18 @@ class Database:
             "ALTER TABLE ema_positions ADD COLUMN entry_spot_price REAL DEFAULT NULL",
             "ALTER TABLE ema_positions ADD COLUMN entry_slippage_pct REAL DEFAULT NULL",
             "ALTER TABLE ema_positions ADD COLUMN exit_slippage_pct REAL DEFAULT NULL",
+            "ALTER TABLE ema_positions ADD COLUMN strategy TEXT DEFAULT 'scalper'",
         ):
             try:
                 await self._conn.execute(statement)
                 await self._conn.commit()
             except Exception:
                 pass
+
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ema_strategy ON ema_positions(strategy)"
+        )
+        await self._conn.commit()
 
     async def execute(self, sql: str, params: tuple = ()) -> aiosqlite.Cursor:
         cursor = await self._conn.execute(sql, params)
@@ -76,6 +82,7 @@ class Database:
         staked_hotkey: str = "",
         entry_spot_price: float | None = None,
         entry_slippage_pct: float | None = None,
+        strategy: str = "scalper",
     ) -> int:
         cursor = await self.execute(
             """
@@ -89,9 +96,10 @@ class Database:
                 amount_tao,
                 amount_alpha,
                 peak_price,
-                staked_hotkey
+                staked_hotkey,
+                strategy
             )
-            VALUES (?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 netuid,
@@ -103,6 +111,7 @@ class Database:
                 amount_alpha,
                 entry_price,
                 staked_hotkey,
+                strategy,
             ),
         )
         return cursor.lastrowid
@@ -148,14 +157,35 @@ class Database:
             (price, position_id),
         )
 
-    async def get_open_ema_positions(self) -> list[dict]:
+    async def get_open_ema_positions(self, strategy: str | None = None) -> list[dict]:
+        if strategy:
+            return await self.fetchall(
+                "SELECT * FROM ema_positions WHERE status = 'OPEN' AND strategy = ? ORDER BY entry_ts",
+                (strategy,),
+            )
         return await self.fetchall(
             "SELECT * FROM ema_positions WHERE status = 'OPEN' ORDER BY entry_ts"
         )
 
-    async def get_ema_positions(self, limit: int = 200) -> list[dict]:
+    async def get_ema_positions(self, limit: int = 200, strategy: str | None = None) -> list[dict]:
+        if strategy:
+            return await self.fetchall(
+                "SELECT * FROM ema_positions WHERE strategy = ? ORDER BY entry_ts DESC LIMIT ?",
+                (strategy, limit),
+            )
         return await self.fetchall(
             "SELECT * FROM ema_positions ORDER BY entry_ts DESC LIMIT ?",
+            (limit,),
+        )
+
+    async def get_closed_ema_positions(self, limit: int = 10, strategy: str | None = None) -> list[dict]:
+        if strategy:
+            return await self.fetchall(
+                "SELECT * FROM ema_positions WHERE status = 'CLOSED' AND strategy = ? ORDER BY exit_ts DESC LIMIT ?",
+                (strategy, limit),
+            )
+        return await self.fetchall(
+            "SELECT * FROM ema_positions WHERE status = 'CLOSED' ORDER BY exit_ts DESC LIMIT ?",
             (limit,),
         )
 

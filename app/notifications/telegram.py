@@ -34,6 +34,7 @@ class TelegramCommandHandlers:
     resume: Callable[[], Awaitable[str]]
     run_cycle: Callable[[], Awaitable[str]]
     export_csv: Callable[[], Awaitable[str | TelegramDocument]]
+    history: Callable[[int], Awaitable[str]]
 
 
 async def send_alert(text: str) -> None:
@@ -210,7 +211,7 @@ class TelegramBot:
 
         if command == "/close":
             if not args:
-                await self.send_message("Usage: <code>/close &lt;position_id|sn42&gt;</code>")
+                await self.send_message("Usage: <code>/close 32</code> (subnet number)")
                 return
             await self.send_message(await self._handlers.close(args[0]))
             return
@@ -235,6 +236,17 @@ class TelegramBot:
                 await self.send_message(result)
             return
 
+        if command == "/history":
+            limit = 5
+            if args:
+                try:
+                    limit = max(1, min(int(args[0]), 20))
+                except ValueError:
+                    await self.send_message("Usage: <code>/history [limit]</code>")
+                    return
+            await self.send_message(await self._handlers.history(limit))
+            return
+
         await self.send_message(
             "Unknown command. Use <code>/help</code> for the EMA control command list."
         )
@@ -250,11 +262,12 @@ class TelegramBot:
                     "commands": [
                         {"command": "status", "description": "EMA bot status"},
                         {"command": "positions", "description": "Open EMA positions"},
-                        {"command": "close", "description": "Close a position"},
+                        {"command": "close", "description": "Close a position (e.g. /close 32)"},
                         {"command": "pause", "description": "Pause EMA entries"},
                         {"command": "resume", "description": "Resume EMA entries"},
                         {"command": "run", "description": "Trigger EMA cycle"},
                         {"command": "export", "description": "Export EMA trades CSV"},
+                        {"command": "history", "description": "Recent closed trades"},
                         {"command": "help", "description": "Show command help"},
                     ]
                 },

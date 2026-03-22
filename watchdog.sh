@@ -4,7 +4,9 @@
 #
 # Install:
 #   crontab -e
-#   */5 * * * * /home/pi/Desktop/SN_Bot/SubnetTrader/watchdog.sh >> /home/pi/Desktop/SN_Bot/SubnetTrader/data/watchdog.log 2>&1
+#   */5 * * * * /path/to/SubnetTrader/watchdog.sh >> /path/to/SubnetTrader/data/watchdog.log 2>&1
+#
+# Or use install.sh which sets this up automatically with the correct paths.
 # ─────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -12,7 +14,7 @@ cd "$SCRIPT_DIR"
 TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 # Check if backend responds to /health within 5 seconds
-if curl -sf --max-time 5 http://localhost:8080/health > /dev/null 2>&1; then
+if curl -sf --max-time 5 http://localhost:8081/health > /dev/null 2>&1; then
     # Healthy — no action needed
     exit 0
 fi
@@ -20,7 +22,7 @@ fi
 echo "[$TIMESTAMP] Backend not responding — restarting..."
 
 # Kill any stale processes
-kill $(lsof -ti:8080) 2>/dev/null
+kill $(lsof -ti:8081) 2>/dev/null
 sleep 2
 
 # Start backend
@@ -31,7 +33,7 @@ echo "[$TIMESTAMP] Backend restarted (PID $BACKEND_PID)"
 
 # Wait for backend to come up
 for i in $(seq 1 20); do
-    if curl -sf --max-time 3 http://localhost:8080/health > /dev/null 2>&1; then
+    if curl -sf --max-time 3 http://localhost:8081/health > /dev/null 2>&1; then
         echo "[$TIMESTAMP] Backend healthy after ${i}s"
         break
     fi
