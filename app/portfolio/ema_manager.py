@@ -63,6 +63,7 @@ class EmaManager:
         self._breaker_tripped_at: datetime | None = None
         self._state_lock = asyncio.Lock()
         self._closing_positions: set[int] = set()
+        self._exit_fail_count: int = 0  # consecutive swap failures across watcher cycles
         # Gini cache: netuid → (gini_value, timestamp)
         self._gini_cache: dict[int, tuple[float, float]] = {}
 
@@ -310,9 +311,21 @@ class EmaManager:
 
     # ── Exit logic ─────────────────────────────────────────────────
 
-    async def run_price_exit_watch(self) -> dict:
-        """Watch open EMA positions with on-chain prices for fast risk exits."""
+    async def run_price_exit_watch(self, dual_held_netuids: set[int] | None = None) -> dict:
+        """Watch open EMA positions with on-chain prices for fast risk exits.
+
+        Args:
+            dual_held_netuids: Netuids held by *both* strategies. If a position's
+                netuid is in this set, skip the exit this cycle to avoid
+                double-dumping liquidity on the same subnet.
+        """
         summary: dict = {"scan_ts": utc_iso(), "mode": "EMA_EXIT_WATCH", "exits": []}
+
+        # Back off if swaps keep failing (e.g. wallet can't pay fees)
+        if self._exit_fail_count >= 3:
+            summary["backoff"] = True
+            self._exit_fail_count = max(0, self._exit_fail_count - 1)  # slowly recover
+            return summary
 
         for pos in await self._open_positions_snapshot():
             onchain_price = await self._executor.get_onchain_alpha_price(pos.netuid)
@@ -326,6 +339,16 @@ class EmaManager:
             reason = self._check_price_exit(pos, onchain_price)
             if not reason:
                 continue
+            # Stagger dual-held exits: skip this cycle, let the other strategy exit first
+            if dual_held_netuids and pos.netuid in dual_held_netuids:
+                logger.warning(
+                    f"EMA[{self._cfg.tag}]: deferring exit SN{pos.netuid} — dual-held, "
+                    f"staggering to avoid double-dump (reason={reason})"
+                )
+                summary.setdefault("deferred", []).append(
+                    {"netuid": pos.netuid, "reason": reason}
+                )
+                continue
             if not await self._reserve_exit(pos.position_id):
                 continue
 
@@ -333,6 +356,9 @@ class EmaManager:
                 result = await self._exit(pos, onchain_price, reason)
                 if result:
                     summary["exits"].append(result)
+                    self._exit_fail_count = 0
+                else:
+                    self._exit_fail_count += 1
             finally:
                 await self._release_exit(pos.position_id)
 
@@ -410,12 +436,16 @@ class EmaManager:
             return None
 
         if swap.success:
-            # PnL based on actual TAO returned vs TAO deployed (real cost basis)
+            # PnL based on actual TAO returned vs TAO deployed
             actual_pnl_tao = swap.received_tao - pos.amount_tao
-            actual_pnl_pct = (actual_pnl_tao / pos.amount_tao * 100) if pos.amount_tao > 0 else 0.0
 
-            # Exit slippage: expected TAO at spot vs actual TAO received
-            expected_tao_out = pos.amount_alpha * cur
+            # Use price-based PnL% (excludes emission yield) so it matches
+            # what Taostats shows and what stop-loss/take-profit conditions check.
+            actual_pnl_pct = (cur - pos.entry_price) / pos.entry_price * 100.0 if pos.entry_price > 0 else 0.0
+
+            # Exit slippage: use on-chain alpha (includes emissions) for accurate calc
+            exit_alpha = swap.received_alpha if swap.received_alpha > 0 else pos.amount_alpha
+            expected_tao_out = exit_alpha * cur
             exit_slippage_pct = (
                 (expected_tao_out - swap.received_tao) / expected_tao_out * 100
                 if expected_tao_out > 0 else None
@@ -433,9 +463,12 @@ class EmaManager:
             async with self._state_lock:
                 self._open = [p for p in self._open if p.position_id != pos.position_id]
                 self._cooldowns[pos.netuid] = utc_now() + timedelta(hours=self._cfg.cooldown_hours)
+            # Emission yield: extra alpha accumulated beyond entry alpha
+            emission_tao = (exit_alpha - pos.amount_alpha) * cur if exit_alpha > pos.amount_alpha else 0.0
+            yield_note = f" (incl ~{emission_tao:.4f} τ emissions)" if emission_tao > 0.01 else ""
             await send_alert(
                 f"📉 <b>[{self._cfg.tag.upper()}] EXIT {reason}</b>: SN{pos.netuid} | "
-                f"PnL {actual_pnl_pct:+.2f}% ({actual_pnl_tao:+.4f} τ) | "
+                f"Price {actual_pnl_pct:+.2f}% | {actual_pnl_tao:+.4f} τ{yield_note} | "
                 f"{swap.received_tao:.4f} τ out"
             )
             return {
@@ -471,13 +504,16 @@ class EmaManager:
             amount_tao = full_amount
 
         # Check actual coldkey balance before live entry
+        # Always keep FEE_RESERVE_TAO in wallet for transaction fees (entries + exits)
         if not self._cfg.dry_run:
             try:
                 ck_balance = await self._executor.get_tao_balance()
-                if ck_balance < amount_tao + 0.01:
+                available = ck_balance - self._cfg.fee_reserve_tao
+                if available < amount_tao:
                     logger.warning(
                         f"EMA SKIP ENTRY SN{netuid}: insufficient balance "
-                        f"{ck_balance:.4f} τ < {amount_tao:.4f} τ needed"
+                        f"{ck_balance:.4f} τ (reserve {self._cfg.fee_reserve_tao} τ) "
+                        f"< {amount_tao:.4f} τ needed"
                     )
                     return None
             except Exception as e:
@@ -564,17 +600,25 @@ class EmaManager:
 
     # ── Manual close ──────────────────────────────────────────────
 
-    async def manual_close(self, position_id: int) -> dict | None:
-        """Manually close an EMA position by ID. Returns result dict or None."""
+    async def manual_close(self, position_id: int) -> dict:
+        """Manually close an EMA position by ID. Returns result dict or raises."""
         pos = await self._find_open_position(position_id)
         if pos is None:
-            return None
+            raise ValueError("Position not found in open positions")
         alpha_prices = await self._taostats.get_alpha_prices()
         cur = alpha_prices.get(pos.netuid, pos.entry_price)
-        if not await self._reserve_exit(pos.position_id):
-            return None
+        # Retry reserving the exit lock — the exit watcher may be holding it
+        for attempt in range(5):
+            if await self._reserve_exit(pos.position_id):
+                break
+            await asyncio.sleep(0.5)
+        else:
+            raise RuntimeError("Position is currently being processed by the exit watcher, try again")
         try:
-            return await self._exit(pos, cur, "MANUAL_CLOSE")
+            result = await self._exit(pos, cur, "MANUAL_CLOSE")
+            if result is None:
+                raise RuntimeError("Swap failed — check wallet balance and chain connectivity")
+            return result
         finally:
             await self._release_exit(pos.position_id)
 

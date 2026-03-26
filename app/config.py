@@ -38,6 +38,7 @@ class StrategyConfig:
     max_entry_price_tao: float
     drawdown_breaker_pct: float
     drawdown_pause_hours: float
+    fee_reserve_tao: float
 
 
 class Settings(BaseSettings):
@@ -82,6 +83,7 @@ class Settings(BaseSettings):
     SCAN_INTERVAL_MIN: int = 15
     MAX_ENTRY_PRICE_TAO: float = 0.1
     MAX_SLIPPAGE_PCT: float = 5.0
+    FEE_RESERVE_TAO: float = 0.5
 
     # Strategy A — "Scalper" (fast=3, slow=9)
     EMA_ENABLED: bool = True
@@ -207,6 +209,7 @@ def strategy_a_config() -> StrategyConfig:
         max_entry_price_tao=settings.MAX_ENTRY_PRICE_TAO,
         drawdown_breaker_pct=settings.EMA_DRAWDOWN_BREAKER_PCT,
         drawdown_pause_hours=settings.EMA_DRAWDOWN_PAUSE_HOURS,
+        fee_reserve_tao=settings.FEE_RESERVE_TAO,
     )
 
 
@@ -238,4 +241,5 @@ def strategy_b_config() -> StrategyConfig:
         max_entry_price_tao=settings.MAX_ENTRY_PRICE_TAO,
         drawdown_breaker_pct=settings.EMA_B_DRAWDOWN_BREAKER_PCT,
         drawdown_pause_hours=settings.EMA_B_DRAWDOWN_PAUSE_HOURS,
+        fee_reserve_tao=settings.FEE_RESERVE_TAO,
     )

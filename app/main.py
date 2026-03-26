@@ -133,6 +133,8 @@ async def run_ema_cycle() -> None:
         if ema_scalper:
             summary = await ema_scalper.run_cycle(globally_occupied=trend_netuids)
             logger.info("Scalper cycle complete", data=summary)
+            # Re-snapshot after scalper may have entered new positions
+            scalper_netuids = {p.netuid for p in await ema_scalper._open_positions_snapshot()}
         if ema_trend:
             summary = await ema_trend.run_cycle(globally_occupied=scalper_netuids)
             logger.info("Trend cycle complete", data=summary)
@@ -140,6 +142,18 @@ async def run_ema_cycle() -> None:
         logger.error(f"EMA cycle failed: {exc}", data={"error": str(exc)})
     finally:
         _ema_cycle_running = False
+
+
+async def _detect_dual_held_netuids() -> set[int]:
+    """Return netuids held by both the scalper and trend strategies."""
+    if not ema_scalper or not ema_trend:
+        return set()
+    scalper = {p.netuid for p in await ema_scalper._open_positions_snapshot()}
+    trend = {p.netuid for p in await ema_trend._open_positions_snapshot()}
+    overlap = scalper & trend
+    if overlap:
+        logger.warning(f"Dual-held subnets detected: {overlap}")
+    return overlap
 
 
 async def run_scalper_exit_watch() -> None:
@@ -155,7 +169,7 @@ async def run_scalper_exit_watch() -> None:
             "last_run": utc_iso(), "last_error": None,
             "last_exit_count": len(summary.get("exits", [])),
         }
-        if summary.get("exits"):
+        if summary.get("exits") or summary.get("deferred"):
             logger.info("Scalper exit watcher complete", data=summary)
     except Exception as exc:
         _scalper_exit_watch_status = {
@@ -172,12 +186,13 @@ async def run_trend_exit_watch() -> None:
     if os.path.exists(settings.KILL_SWITCH_PATH):
         return
     try:
-        summary = await ema_trend.run_price_exit_watch()
+        dual = await _detect_dual_held_netuids()
+        summary = await ema_trend.run_price_exit_watch(dual_held_netuids=dual)
         _trend_exit_watch_status = {
             "last_run": utc_iso(), "last_error": None,
             "last_exit_count": len(summary.get("exits", [])),
         }
-        if summary.get("exits"):
+        if summary.get("exits") or summary.get("deferred"):
             logger.info("Trend exit watcher complete", data=summary)
     except Exception as exc:
         _trend_exit_watch_status = {
@@ -859,9 +874,12 @@ def create_health_app():
             mgr = {"scalper": ema_scalper, "trend": ema_trend}.get(row["strategy"])
             if mgr is None:
                 raise HTTPException(status_code=503, detail="Strategy manager not initialized")
-            result = await mgr.manual_close(position_id)
-            if result is None:
-                raise HTTPException(status_code=404, detail="Position not found or already closing")
+            try:
+                result = await mgr.manual_close(position_id)
+            except ValueError as e:
+                raise HTTPException(status_code=404, detail=str(e))
+            except RuntimeError as e:
+                raise HTTPException(status_code=409, detail=str(e))
             return JSONResponse(content={"success": True, "result": result})
 
         @app.get("/api/ema/slippage-stats")
@@ -1099,6 +1117,19 @@ async def main() -> None:
                 f"Scan: {settings.SCAN_INTERVAL_MIN}m\n"
                 f"Commands: <code>/help</code>"
             )
+
+        # R3: Detect dual-held subnets at startup and warn
+        if ema_scalper and ema_trend:
+            dual = await _detect_dual_held_netuids()
+            if dual:
+                msg = (
+                    f"⚠️ <b>Dual-held subnets at startup</b>\n"
+                    f"Both Scalper and Trend hold: {sorted(dual)}\n"
+                    f"Trend exit watcher will defer exits on these to avoid double-dumping.\n"
+                    f"Use <code>/close</code> to manually close the worse position."
+                )
+                logger.warning(msg)
+                await send_alert(msg)
 
         if settings.EMA_ENABLED or settings.EMA_B_ENABLED:
             await run_ema_cycle()

@@ -423,10 +423,12 @@ class Widget:
             return
 
         import tkinter.messagebox as mbox
+        pnl_pct = pos.get("pnl_pct", 0)
+        pnl_tao = pos.get("pnl_tao") or (pnl_pct * pos.get("amount_tao", 0) / 100)
         ok = self._mbox_wrap(mbox.askyesno, "Close Position",
                              f"Close {name} (SN{pos['netuid']})?\n"
                              f"Strategy: {strat}\n"
-                             f"PnL: {pos.get('pnl_pct', 0):+.1f}%")
+                             f"PnL: {pnl_pct:+.1f}%  ({pnl_tao:+.3f} τ)")
         if not ok:
             return
 

@@ -1024,6 +1024,7 @@ export default function EmaPage() {
   );
   const [closingId, setClosingId] = useState<number | null>(null);
   const [confirmId, setConfirmId] = useState<number | null>(null);
+  const [closeError, setCloseError] = useState<string | null>(null);
   const [showUsd, setShowUsd] = useState(true);
   const [clockMs, setClockMs] = useState(() => Date.now());
   const [toastEvents, setToastEvents] = useState<ExitEvent[]>([]);
@@ -1122,29 +1123,21 @@ export default function EmaPage() {
     prevOpenMapRef.current = currentOpenMap;
   }, [scalper?.open_positions, trend?.open_positions, posData]);
 
-  function requestClose(positionId: number) {
-    if (confirmId === positionId) {
-      executeClose(positionId);
-    } else {
-      setConfirmId(positionId);
-      setTimeout(() => setConfirmId((prev) => (prev === positionId ? null : prev)), 4000);
-    }
-  }
-
   async function executeClose(positionId: number) {
     setClosingId(positionId);
     setConfirmId(null);
     try {
       const res = await fetch(`${API}/api/ema/positions/${positionId}/close`, { method: "POST" });
       if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        throw new Error(`HTTP ${res.status}: ${body}`);
+        const body = await res.json().catch(() => null);
+        const detail = body?.detail ?? `HTTP ${res.status}`;
+        throw new Error(detail);
       }
-      mutatePort();
-      mutatePos();
-      mutateRecentTrades();
+      // Refresh data and trigger exit animation via SWR
+      await Promise.all([mutatePort(), mutatePos(), mutateRecentTrades()]);
     } catch (e) {
-      alert(`Failed to close position: ${e instanceof Error ? e.message : "unknown error"}`);
+      setCloseError(e instanceof Error ? e.message : "Unknown error");
+      setTimeout(() => setCloseError(null), 6000);
     } finally {
       setClosingId(null);
     }
@@ -1420,6 +1413,15 @@ export default function EmaPage() {
         </div>
       )}
 
+      {/* Close error banner */}
+      {closeError && (
+        <div className="mb-4 px-4 py-3 bg-red-900/40 border border-red-700 rounded-lg text-sm text-red-200 flex items-center gap-2">
+          <span className="text-red-400 text-lg">⚠</span>
+          <span>Close failed: {closeError}</span>
+          <button onClick={() => setCloseError(null)} className="ml-auto text-red-400 hover:text-red-300">✕</button>
+        </div>
+      )}
+
       {/* Open positions with charts — split by strategy */}
       {positionCards.length > 0 && (
         <div className="mb-10">
@@ -1543,21 +1545,48 @@ export default function EmaPage() {
                           <span className="text-xs text-gray-600">
                             Peak: {fmtPrice(pos.peak_price, showUsd, taoUsd)} · {fmtDate(pos.entry_ts)}
                           </span>
-                          <button
-                            onClick={() => requestClose(pos.position_id)}
-                            disabled={closingId === pos.position_id}
-                            className={`px-3 py-1.5 text-xs font-semibold rounded border disabled:opacity-50 transition-colors ${
-                              confirmId === pos.position_id
-                                ? "border-red-500 bg-red-900/50 text-red-300 animate-pulse"
-                                : closeBtnColor
-                            }`}
-                          >
-                            {closingId === pos.position_id
-                              ? "Closing..."
-                              : confirmId === pos.position_id
-                              ? "Tap again to confirm"
-                              : `Close ${fmtPnl(pnlTao, showUsd, taoUsd, 3)}`}
-                          </button>
+                          {closingId === pos.position_id ? (
+                            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-400">
+                              <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                              </svg>
+                              Closing…
+                            </span>
+                          ) : confirmId === pos.position_id ? (
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs text-gray-300">
+                                Close at{" "}
+                                <span className={pnlColor}>
+                                  {pos.pnl_pct >= 0 ? "+" : ""}{pos.pnl_pct.toFixed(2)}%
+                                </span>
+                                {" "}(~{fmtPnl(pnlTao, showUsd, taoUsd, 4)})?
+                              </span>
+                              <button
+                                onClick={() => executeClose(pos.position_id)}
+                                className="px-2 h-7 text-xs font-bold rounded bg-amber-600 hover:bg-amber-500 text-white transition-colors"
+                              >
+                                Confirm
+                              </button>
+                              <button
+                                onClick={() => setConfirmId(null)}
+                                className="px-2 h-7 text-xs rounded border border-gray-600 text-gray-400 hover:text-gray-200 transition-colors"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => setConfirmId(pos.position_id)}
+                              className={`inline-flex items-center gap-1.5 px-2.5 h-7 text-xs font-semibold rounded border ${closeBtnColor} transition-all duration-200`}
+                              title="Close position"
+                            >
+                              Close ·{" "}
+                              <span>{pos.pnl_pct >= 0 ? "+" : ""}{pos.pnl_pct.toFixed(2)}%</span>
+                              {" "}·{" "}
+                              <span>{fmtPnl(pnlTao, showUsd, taoUsd, 4)}</span>
+                            </button>
+                          )}
                         </div>
                       </div>
                     );

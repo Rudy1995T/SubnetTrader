@@ -714,6 +714,8 @@ class SwapExecutor:
                         self._wallet.coldkey.ss58_address
                     )
                     tao_received = float(bal_after) - float(bal_before)
+                    # Report on-chain alpha so callers can separate emission yield from price PnL
+                    alpha_received = alpha_float
                 else:
                     # Subnet-to-subnet: swap stake using the stored validator hotkey
                     result = self._substrate.swap_stake(
