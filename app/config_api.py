@@ -35,7 +35,6 @@ FIELD_TYPES: dict[str, str] = {
     "BT_WALLET_HOTKEY": "wallet_name",
     "BT_WALLET_PATH": "path",
     "BT_WALLET_PASSWORD": "str",
-    "FLAMEWIRE_API_KEY": "str",
     "TAOSTATS_API_KEY": "str",
     "TELEGRAM_BOT_TOKEN": "telegram_token",
     "TELEGRAM_CHAT_ID": "telegram_chat_id",
@@ -119,7 +118,6 @@ WALLET_FIELDS = {"BT_WALLET_NAME", "BT_WALLET_HOTKEY", "BT_WALLET_PATH", "BT_WAL
 
 # .env section template for writing
 ENV_TEMPLATE_ORDER = [
-    ("# FlameWire RPC", ["FLAMEWIRE_API_KEY"]),
     ("# Taostats", ["TAOSTATS_API_KEY"]),
     ("# Wallet", ["BT_WALLET_NAME", "BT_WALLET_HOTKEY", "BT_WALLET_PATH", "BT_WALLET_PASSWORD"]),
     ("# Scheduler", ["SCAN_INTERVAL_MIN"]),
@@ -415,7 +413,10 @@ async def config_get():
 
 @router.post("")
 async def config_post(body: dict[str, Any]):
-    values: dict[str, Any] = body.get("values", {})
+    if "values" in body:
+        values: dict[str, Any] = body["values"]
+    else:
+        values = {k: v for k, v in body.items() if k != "restart"}
     do_restart: bool = body.get("restart", False)
 
     # Validate all fields
@@ -794,21 +795,7 @@ async def go_live_preflight(body: dict):
         checks["wallet_unlockable"] = {"ok": False, "detail": "bittensor SDK not installed"}
         checks["balance_sufficient"] = {"ok": False, "detail": "SDK unavailable"}
 
-    # 4. RPC connected
-    try:
-        from app.chain.flamewire_rpc import FlameWireRPC
-
-        temp_rpc = FlameWireRPC()
-        rpc_ok = await temp_rpc.health_check()
-        checks["rpc_connected"] = {
-            "ok": rpc_ok,
-            "detail": "FlameWire healthy" if rpc_ok else "FlameWire unreachable",
-        }
-        await temp_rpc.close()
-    except Exception as exc:
-        checks["rpc_connected"] = {"ok": False, "detail": str(exc)}
-
-    # 5. Taostats reachable
+    # 4. Taostats reachable
     try:
         taostats_key = settings.TAOSTATS_API_KEY or ""
         headers = {"Authorization": taostats_key} if taostats_key else {}

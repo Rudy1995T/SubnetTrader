@@ -189,6 +189,20 @@ class Database:
             (limit,),
         )
 
+    async def set_cooldown(self, strategy: str, netuid: int, expires_at: str) -> None:
+        await self.execute(
+            "INSERT OR REPLACE INTO ema_cooldowns (strategy, netuid, expires_at) VALUES (?, ?, ?)",
+            (strategy, netuid, expires_at),
+        )
+
+    async def get_cooldowns(self, strategy: str) -> dict:
+        rows = await self.fetchall(
+            "SELECT netuid, expires_at FROM ema_cooldowns WHERE strategy = ? AND expires_at > ?",
+            (strategy, utc_iso()),
+        )
+        from app.utils.time import parse_iso as _parse_iso
+        return {r["netuid"]: _parse_iso(r["expires_at"]) for r in rows}
+
     async def clear_ema_history(self) -> None:
         await self.execute("DELETE FROM ema_positions")
 

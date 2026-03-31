@@ -16,7 +16,6 @@ export interface ConfigValues {
   BT_WALLET_HOTKEY: string;
   BT_WALLET_PATH: string;
   BT_WALLET_PASSWORD: string;
-  FLAMEWIRE_API_KEY: string;
   TAOSTATS_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_CHAT_ID: string;
@@ -52,7 +51,6 @@ const DEFAULT_VALUES: ConfigValues = {
   BT_WALLET_HOTKEY: "default",
   BT_WALLET_PATH: "~/.bittensor/wallets",
   BT_WALLET_PASSWORD: "",
-  FLAMEWIRE_API_KEY: "",
   TAOSTATS_API_KEY: "",
   TELEGRAM_BOT_TOKEN: "",
   TELEGRAM_CHAT_ID: "",
@@ -858,21 +856,6 @@ export default function SetupWizard({ mode, initialValues, onComplete }: SetupWi
       </div>
 
       <div>
-        <FieldLabel htmlFor="flamewire-key" tip="FlameWire provides premium RPC access with lower latency. Optional — the bot works without it using the public subtensor endpoint.">FlameWire API Key</FieldLabel>
-        <p className="text-gray-500 text-xs mb-2">
-          Provides fast RPC access to the Bittensor chain. Without a key, the bot falls back
-          to the public subtensor endpoint, which may be slower.{" "}
-          <ExternalLink href="https://flamewire.io">Get a key at flamewire.io</ExternalLink>
-        </p>
-        <PasswordInput
-          id="flamewire-key"
-          value={values.FLAMEWIRE_API_KEY}
-          onChange={(v) => set("FLAMEWIRE_API_KEY", v)}
-          placeholder="Optional"
-        />
-      </div>
-
-      <div>
         <FieldLabel htmlFor="taostats-key" tip="Taostats provides subnet pool data and price history. The free tier (no key) allows 30 requests/min, which is enough for most setups.">Taostats API Key</FieldLabel>
         <p className="text-gray-500 text-xs mb-2">
           Provides subnet price data and pool metrics. Without a key, the free tier is used
@@ -1134,7 +1117,6 @@ export default function SetupWizard({ mode, initialValues, onComplete }: SetupWi
         title: "API Keys",
         step: 1,
         items: [
-          ["FlameWire", values.FLAMEWIRE_API_KEY ? "Set" : "Not set"],
           ["Taostats", values.TAOSTATS_API_KEY ? "Set" : "Not set"],
         ],
       },

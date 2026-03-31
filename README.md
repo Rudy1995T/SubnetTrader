@@ -30,7 +30,7 @@ The setup wizard walks you through wallet, API keys, and trading configuration. 
 │  └──────┬──────┘  └────┬─────┘  └──────────────┘          │
 │         │              │                                   │
 │  ┌──────┴──────┐  ┌────┴──────────┐  ┌──────────┐         │
-│  │ Taostats    │  │ FlameWire RPC │  │ Telegram │         │
+│  │ Taostats    │  │ Subtensor     │  │ Telegram │         │
 │  │ (prices)    │  │ (chain ops)   │  │ (alerts) │         │
 │  └─────────────┘  └───────────────┘  └──────────┘         │
 │                                                            │
@@ -45,7 +45,6 @@ The setup wizard walks you through wallet, API keys, and trading configuration. 
 | `app/main.py` | FastAPI server, scheduler, API endpoints |
 | `app/portfolio/ema_manager.py` | EMA crossover strategy (entries, exits, risk) |
 | `app/chain/executor.py` | On-chain staking: `add_stake`, `unstake_all` |
-| `app/chain/flamewire_rpc.py` | FlameWire WebSocket/HTTP RPC client |
 | `app/data/taostats_client.py` | Taostats API — pool data, prices |
 | `app/config.py` | All settings via pydantic-settings |
 | `app/config_api.py` | POST/GET `/api/config`, wallet ops, go-live |
@@ -73,11 +72,8 @@ All settings live in `.env` (created from `.env.example` by `install.sh`). They 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FLAMEWIRE_API_KEY` | _(empty)_ | FlameWire RPC key for fast chain access. Without it, falls back to public subtensor |
-| `FLAMEWIRE_TIMEOUT` | `30.0` | RPC request timeout (seconds) |
-| `FLAMEWIRE_RETRIES` | `3` | Retry count on RPC failure |
-| `SUBTENSOR_FALLBACK_NETWORK` | `wss://entrypoint-finney.opentensor.ai:443` | Public subtensor endpoint (fallback) |
-| `TAOSTATS_API_KEY` | _(empty)_ | Taostats API key. Free tier works (30 req/min) |
+| `SUBTENSOR_NETWORK` | `wss://entrypoint-finney.opentensor.ai:443` | Subtensor WebSocket endpoint |
+| `TAOSTATS_API_KEY` | _(empty)_ | Taostats API key for pool data and prices |
 | `TAOSTATS_CACHE_TTL_SEC` | `300` | How long to cache pool data (seconds) |
 
 ### EMA Strategy
@@ -165,7 +161,7 @@ bash start.sh
 
 - **Coldkey not found**: Check `BT_WALLET_PATH` and `BT_WALLET_NAME`. The wallet directory should exist at `<path>/<name>/`.
 - **Could not unlock coldkey**: Wrong password. If the coldkey is encrypted, set `BT_WALLET_PASSWORD` in `.env` or the setup wizard.
-- **Balance unavailable**: The chain endpoint may be down. Check your internet connection and `FLAMEWIRE_API_KEY`.
+- **Balance unavailable**: The chain endpoint may be down. Check your internet connection.
 
 ### Trades not executing (live mode)
 

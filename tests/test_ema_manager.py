@@ -38,6 +38,7 @@ def _test_config(**overrides) -> StrategyConfig:
         "max_entry_price_tao": 0.1,
         "drawdown_breaker_pct": 15.0,
         "drawdown_pause_hours": 6.0,
+        "fee_reserve_tao": 0.01,
     }
     defaults.update(overrides)
     return StrategyConfig(**defaults)
@@ -94,7 +95,7 @@ class TestEmaExitWatcher:
         ]
         executor.get_onchain_alpha_price = AsyncMock(return_value=1.11)
         executor.execute_swap = AsyncMock(
-            return_value=SimpleNamespace(success=True, received_tao=2.22)
+            return_value=SimpleNamespace(success=True, received_tao=2.22, received_alpha=2.0)
         )
 
         with patch("app.portfolio.ema_manager.send_alert", new=AsyncMock()):

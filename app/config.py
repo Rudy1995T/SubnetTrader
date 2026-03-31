@@ -48,21 +48,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    FLAMEWIRE_API_KEY: str = ""
-    FLAMEWIRE_CHAIN: str = "bittensor"
-    FLAMEWIRE_HTTP_TEMPLATE: str = (
-        "https://gateway-dev.flamewire.io/public/rpc/{chain}/{api_key}"
-    )
-    FLAMEWIRE_WS_TEMPLATE: str = (
-        "wss://gateway-dev.flamewire.io/public/rpc/{chain}/{api_key}"
-    )
-    FLAMEWIRE_TIMEOUT: float = 30.0
-    FLAMEWIRE_RETRIES: int = 3
-    FLAMEWIRE_RETRY_DELAY: float = 2.0
-    FLAMEWIRE_WS_PING_INTERVAL: float = 20.0
-    FLAMEWIRE_WS_RECONNECT_DELAY: float = 5.0
-
-    SUBTENSOR_FALLBACK_NETWORK: str = "wss://entrypoint-finney.opentensor.ai:443"
+    SUBTENSOR_NETWORK: str = "wss://entrypoint-finney.opentensor.ai:443"
 
     TAOSTATS_API_KEY: str = ""
     TAOSTATS_BASE_URL: str = "https://api.taostats.io"
@@ -147,26 +133,6 @@ class Settings(BaseSettings):
     JSONL_DIR: str = "data/logs"
     HEALTH_PORT: int = 8081
     KILL_SWITCH_PATH: str = "./KILL_SWITCH"
-
-    @property
-    def flamewire_http_url(self) -> str:
-        if self.FLAMEWIRE_API_KEY:
-            return self.FLAMEWIRE_HTTP_TEMPLATE.format(
-                chain=self.FLAMEWIRE_CHAIN,
-                api_key=self.FLAMEWIRE_API_KEY,
-            )
-        base = self.FLAMEWIRE_HTTP_TEMPLATE.split("/{api_key}")[0]
-        return base.format(chain=self.FLAMEWIRE_CHAIN)
-
-    @property
-    def flamewire_ws_url(self) -> str:
-        if self.FLAMEWIRE_API_KEY:
-            return self.FLAMEWIRE_WS_TEMPLATE.format(
-                chain=self.FLAMEWIRE_CHAIN,
-                api_key=self.FLAMEWIRE_API_KEY,
-            )
-        base = self.FLAMEWIRE_WS_TEMPLATE.split("/{api_key}")[0]
-        return base.format(chain=self.FLAMEWIRE_CHAIN)
 
     @field_validator("LOG_LEVEL")
     @classmethod

@@ -1,6 +1,5 @@
 """
-Trading execution layer – swap simulation & execution using Bittensor SDK
-with FlameWire as the RPC backend.
+Trading execution layer – swap simulation & execution using Bittensor SDK.
 """
 from __future__ import annotations
 
@@ -8,7 +7,6 @@ import asyncio
 from dataclasses import dataclass
 
 from app.config import settings
-from app.chain.flamewire_rpc import FlameWireRPC
 from app.logging.logger import logger
 from app.utils.time import utc_iso
 
@@ -59,17 +57,16 @@ class SwapExecutor:
     subnet alpha tokens via the Bittensor Swap pallet.
     """
 
-    def __init__(self, rpc: FlameWireRPC) -> None:
-        self._rpc = rpc
+    def __init__(self) -> None:
         self._wallet = None
         self._substrate = None
-        self._active_endpoint: str = ""
         self._validator_hotkey_cache: dict[int, str] = {}  # netuid → hotkey_ss58
+        # Serializes all substrate WebSocket calls — substrate is not safe for concurrent recv
+        self._substrate_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """
         Initialize the Bittensor wallet and substrate connection.
-        Uses FlameWire as the endpoint.
         """
         if settings.EMA_DRY_RUN:
             logger.info(
@@ -93,8 +90,7 @@ class SwapExecutor:
                 data={
                     "wallet": settings.BT_WALLET_NAME,
                     "hotkey": settings.BT_WALLET_HOTKEY,
-                    "rpc": settings.flamewire_ws_url,
-                    "fallback_rpc": settings.SUBTENSOR_FALLBACK_NETWORK,
+                    "rpc": settings.SUBTENSOR_NETWORK,
                 },
             )
         except ImportError:
@@ -104,13 +100,8 @@ class SwapExecutor:
         except Exception as e:
             logger.error(f"Failed to initialize bittensor wallet: {e}")
 
-    async def _ensure_substrate(self, *, skip_endpoint: str = "") -> None:
-        """Lazily connect to Subtensor when a live chain action requires it.
-
-        Tries FlameWire first, then falls back to the public Finney endpoint.
-        If *skip_endpoint* is set, that URL is skipped (used on reconnect to
-        avoid the endpoint that just died).
-        """
+    async def _ensure_substrate(self) -> None:
+        """Lazily connect to Subtensor when a live chain action requires it."""
         if self._substrate is not None:
             return
         if self._wallet is None:
@@ -118,74 +109,37 @@ class SwapExecutor:
 
         import bittensor as bt
 
-        endpoints = [
-            ("flamewire", settings.flamewire_ws_url),
-            ("finney-fallback", settings.SUBTENSOR_FALLBACK_NETWORK),
-        ]
-
-        last_error: Exception | None = None
-        for label, url in endpoints:
-            if url == skip_endpoint:
-                logger.info(f"Skipping {label} (previously failed)")
-                continue
-            try:
-                sub = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(
-                        None,
-                        lambda u=url: bt.Subtensor(network=u),
-                    ),
-                    timeout=30,
-                )
-                # Verify the connection is actually alive with a quick balance query
-                try:
-                    await asyncio.wait_for(
-                        asyncio.get_running_loop().run_in_executor(
-                            None,
-                            lambda: sub.get_balance(self._wallet.coldkey.ss58_address),
-                        ),
-                        timeout=15,
-                    )
-                except Exception as health_err:
-                    logger.warning(
-                        f"Substrate via {label} connected but health check failed: {health_err}",
-                        data={"rpc": url},
-                    )
-                    last_error = health_err
-                    continue
-
-                self._substrate = sub
-                self._active_endpoint = url
-                logger.info(
-                    f"Substrate connection established via {label}",
-                    data={"rpc": url},
-                )
-                return
-            except Exception as e:
-                last_error = e
-                logger.warning(
-                    f"Substrate connection failed via {label}: {e}",
-                    data={"rpc": url},
-                )
-
-        raise RuntimeError(
-            f"All Subtensor endpoints failed – last error: {last_error}"
-        )
+        url = settings.SUBTENSOR_NETWORK
+        try:
+            sub = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda u=url: bt.Subtensor(network=u),
+                ),
+                timeout=30,
+            )
+            # Verify the connection is actually alive with a quick balance query
+            await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: sub.get_balance(self._wallet.coldkey.ss58_address),
+                ),
+                timeout=15,
+            )
+            self._substrate = sub
+            logger.info(
+                "Substrate connection established",
+                data={"rpc": url},
+            )
+        except Exception as e:
+            raise RuntimeError(f"Subtensor connection failed ({url}): {e}")
 
     async def _reconnect_substrate(self) -> None:
-        """Force a fresh Subtensor connection (e.g. after a dead-socket error).
-
-        Skips the endpoint that was active when the failure occurred so we
-        fall back to the healthy one immediately.
-        """
-        failed_endpoint = self._active_endpoint
-        logger.warning(
-            "Forcing Subtensor reconnect",
-            data={"failed_endpoint": failed_endpoint},
-        )
+        """Force a fresh Subtensor connection (e.g. after a dead-socket error)."""
+        logger.warning("Forcing Subtensor reconnect")
         self._substrate = None
-        self._active_endpoint = ""
         self._validator_hotkey_cache.clear()
-        await self._ensure_substrate(skip_endpoint=failed_endpoint)
+        await self._ensure_substrate()
 
     def _get_validator_hotkey_sync(self, netuid: int) -> str:
         """
@@ -245,14 +199,15 @@ class SwapExecutor:
 
         if self._substrate is not None:
             try:
-                # Use SDK simulation
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self._sim_swap_sdk,
-                    origin_netuid,
-                    destination_netuid,
-                    amount_rao,
-                )
+                # Use SDK simulation — hold lock to prevent concurrent substrate recv
+                async with self._substrate_lock:
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        self._sim_swap_sdk,
+                        origin_netuid,
+                        destination_netuid,
+                        amount_rao,
+                    )
                 expected_out_rao = result.get("expected_out", 0)
                 fee_rao = result.get("fee", 0)
             except Exception as e:
@@ -494,6 +449,24 @@ class SwapExecutor:
                 received_alpha=alpha_received,
             )
         except Exception as e:
+            # No alpha staked on-chain — position was never funded or already exited externally.
+            # Close it as a full loss (0 TAO recovered) so it's not stuck forever as OPEN.
+            if "ZERO_ALPHA_ON_CHAIN" in str(e):
+                logger.warning(
+                    f"Exit SN{origin_netuid}: no alpha stake found on-chain, closing as full loss"
+                )
+                return SwapResult(
+                    success=True,
+                    tx_hash="NO_STAKE",
+                    origin_netuid=origin_netuid,
+                    destination_netuid=destination_netuid,
+                    amount_tao=amount_tao,
+                    received_tao=0.0,
+                    fee_tao=0.0,
+                    slippage_pct=0.0,
+                    error="zero_alpha",
+                    timestamp=timestamp,
+                )
             # Retry once after reconnect for connection-level failures
             err_str = str(e).lower()
             is_conn_error = any(
@@ -627,6 +600,9 @@ class SwapExecutor:
                         f"hotkey={target_hotkey[:12]}..."
                     )
 
+                    if alpha_float < 0.001:
+                        raise RuntimeError("ZERO_ALPHA_ON_CHAIN")
+
                     # Determine number of chunks based on pool depth.
                     # Each chunk should be small enough to keep slippage per chunk < 5%.
                     # For constant-product AMM: price_impact ≈ amount / pool_reserve.
@@ -739,48 +715,65 @@ class SwapExecutor:
             except Exception as e:
                 raise RuntimeError(f"On-chain swap failed: {e}")
 
-        tx_hash, alpha_received, tao_received = await asyncio.get_event_loop().run_in_executor(None, _do_swap)
+        # Hold lock for the entire swap — substrate WebSocket is not safe for concurrent recv
+        async with self._substrate_lock:
+            tx_hash, alpha_received, tao_received = await asyncio.get_event_loop().run_in_executor(None, _do_swap)
         return tx_hash, alpha_received, tao_received
+
+    async def get_onchain_stake(self, hotkey_ss58: str, netuid: int) -> float:
+        """Return the coldkey's alpha stake for a given hotkey+netuid (0.0 if unavailable)."""
+        if self._substrate is None or self._wallet is None:
+            return 0.0
+
+        def _query() -> float:
+            bal = self._substrate.get_stake(
+                coldkey_ss58=self._wallet.coldkey.ss58_address,
+                hotkey_ss58=hotkey_ss58,
+                netuid=netuid,
+            )
+            return float(bal)
+
+        try:
+            async with self._substrate_lock:
+                return await asyncio.get_running_loop().run_in_executor(None, _query)
+        except Exception as e:
+            logger.warning(f"get_onchain_stake SN{netuid} failed: {e}")
+            return 0.0
 
     async def get_tao_balance(self) -> float:
         """Get the coldkey's free TAO balance (used for staking)."""
         if self._substrate is not None and self._wallet is not None:
             try:
-                balance = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: self._substrate.get_balance(self._wallet.coldkey.ss58_address),
-                )
+                async with self._substrate_lock:
+                    balance = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda: self._substrate.get_balance(self._wallet.coldkey.ss58_address),
+                    )
                 return rao_to_tao(int(balance))
             except Exception as e:
-                logger.warning(f"Failed to get balance via SDK: {e}")
-                # Retry once after reconnect for connection failures
-                err_str = str(e).lower()
-                if any(kw in err_str for kw in ("broken pipe", "connection", "closed", "timeout", "eof", "websocket")):
-                    try:
-                        await self._reconnect_substrate()
-                        balance = await asyncio.get_running_loop().run_in_executor(
-                            None,
-                            lambda: self._substrate.get_balance(self._wallet.coldkey.ss58_address),
-                        )
-                        return rao_to_tao(int(balance))
-                    except Exception as retry_e:
-                        logger.warning(f"Balance retry after reconnect also failed: {retry_e}")
+                logger.warning(f"Failed to get balance via SDK (shared conn): {e}")
 
         # In dry-run mode, return the configured simulated balance for position sizing.
         if settings.EMA_DRY_RUN:
             return settings.EMA_DRY_RUN_STARTING_TAO
 
-        # Fallback via RPC (live mode only)
-        try:
-            if self._wallet is not None:
-                addr = self._wallet.hotkey.ss58_address
-            else:
-                addr = ""
-            if addr:
-                balance = await self._rpc.get_balance(addr)
-                return rao_to_tao(balance)
-        except Exception as e:
-            logger.warning(f"Failed to get balance via RPC: {e}")
+        # Last resort: fresh Subtensor connection (avoids WebSocket contention)
+        if self._wallet is not None:
+            try:
+                import bittensor as bt
+                coldkey_addr = self._wallet.coldkey.ss58_address
+                balance = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda: bt.Subtensor(
+                            network=settings.SUBTENSOR_NETWORK
+                        ).get_balance(coldkey_addr),
+                    ),
+                    timeout=15,
+                )
+                return rao_to_tao(int(balance))
+            except Exception as e:
+                logger.warning(f"Failed to get balance via Subtensor fallback: {e}")
 
         return 0.0
 
@@ -804,14 +797,16 @@ class SwapExecutor:
             return tao_r / alpha_r  # both in rao, so ratio = TAO-per-alpha
 
         try:
-            return await asyncio.get_running_loop().run_in_executor(None, _query)
+            async with self._substrate_lock:
+                return await asyncio.get_running_loop().run_in_executor(None, _query)
         except Exception as e:
             logger.warning(f"Failed to get on-chain price for SN{netuid}: {e}")
             err_str = str(e).lower()
             if any(kw in err_str for kw in ("broken pipe", "connection", "closed", "timeout", "eof", "websocket")):
                 try:
                     await self._reconnect_substrate()
-                    return await asyncio.get_running_loop().run_in_executor(None, _query)
+                    async with self._substrate_lock:
+                        return await asyncio.get_running_loop().run_in_executor(None, _query)
                 except Exception:
                     pass
             return 0.0

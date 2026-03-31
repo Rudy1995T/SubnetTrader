@@ -642,14 +642,6 @@ export default function SettingsPage() {
       {/* API Keys */}
       <Section title="API Keys">
         <div>
-          <FieldLabel htmlFor="s-flamewire" tip="FlameWire provides premium RPC access with lower latency. Optional — the bot works without it using the public subtensor endpoint. Get a key at flamewire.io">FlameWire API Key</FieldLabel>
-          <PasswordInput
-            id="s-flamewire"
-            value={String(values.FLAMEWIRE_API_KEY || "")}
-            onChange={(v) => set("FLAMEWIRE_API_KEY", v)}
-          />
-        </div>
-        <div>
           <FieldLabel htmlFor="s-taostats" tip="Taostats provides subnet pool data and price history. The free tier (no key) allows 30 req/min. Get a key at taostats.io">Taostats API Key</FieldLabel>
           <div className="flex gap-2">
             <div className="flex-1">

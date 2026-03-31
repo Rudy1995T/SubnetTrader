@@ -23,3 +23,10 @@ CREATE TABLE IF NOT EXISTS ema_positions (
 
 CREATE INDEX IF NOT EXISTS idx_ema_status ON ema_positions(status);
 CREATE INDEX IF NOT EXISTS idx_ema_netuid ON ema_positions(netuid);
+
+CREATE TABLE IF NOT EXISTS ema_cooldowns (
+    strategy   TEXT    NOT NULL,
+    netuid     INTEGER NOT NULL,
+    expires_at TEXT    NOT NULL,
+    PRIMARY KEY (strategy, netuid)
+);

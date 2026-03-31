@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import typing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -66,6 +67,8 @@ class EmaManager:
         self._exit_fail_count: int = 0  # consecutive swap failures across watcher cycles
         # Gini cache: netuid → (gini_value, timestamp)
         self._gini_cache: dict[int, tuple[float, float]] = {}
+        # Companion exit callback: set by main.py to notify the other strategy
+        self._companion_exit_cb: typing.Callable[..., typing.Awaitable[float]] | None = None
 
     # ── Init ───────────────────────────────────────────────────────
 
@@ -84,7 +87,7 @@ class EmaManager:
             )
             for r in rows
         ]
-        self._cooldowns = {}
+        self._cooldowns = await self._db.get_cooldowns(self._cfg.tag)
         self._pot_history = []
         self._breaker_tripped_at = None
         self._closing_positions = set()
@@ -411,6 +414,43 @@ class EmaManager:
     async def _exit(self, pos: EmaPosition, cur: float, reason: str) -> dict | None:
         pnl_pct = (cur - pos.entry_price) / pos.entry_price * 100.0
 
+        # Ghost detection: if on-chain alpha is effectively zero, the position
+        # was already exited (e.g. companion strategy's unstake_all consumed it).
+        if not self._cfg.dry_run and pos.staked_hotkey:
+            onchain_alpha = await self._executor.get_onchain_stake(pos.staked_hotkey, pos.netuid)
+            if onchain_alpha < 0.001:
+                logger.warning(
+                    f"EMA[{self._cfg.tag}] GHOST detected SN{pos.netuid}: "
+                    f"on-chain alpha={onchain_alpha:.6f}, closing as full loss"
+                )
+                ghost_pnl = -pos.amount_tao
+                ghost_pnl_pct = -100.0
+                await self._db.close_ema_position(
+                    position_id=pos.position_id,
+                    exit_price=cur,
+                    amount_tao_out=0.0,
+                    pnl_tao=ghost_pnl,
+                    pnl_pct=ghost_pnl_pct,
+                    exit_reason="GHOST_CLOSE",
+                )
+                self._realized_pnl += ghost_pnl
+                expires = utc_now() + timedelta(hours=self._cfg.cooldown_hours)
+                async with self._state_lock:
+                    self._open = [p for p in self._open if p.position_id != pos.position_id]
+                    self._cooldowns[pos.netuid] = expires
+                await self._db.set_cooldown(self._cfg.tag, pos.netuid, expires.isoformat())
+                await send_alert(
+                    f"👻 <b>[{self._cfg.tag.upper()}] GHOST CLOSE</b>: SN{pos.netuid} | "
+                    f"No alpha on-chain — closed as {ghost_pnl:+.4f} τ loss"
+                )
+                return {
+                    "netuid": pos.netuid,
+                    "reason": "GHOST_CLOSE",
+                    "pnl_pct": round(ghost_pnl_pct, 2),
+                    "pnl_tao": round(ghost_pnl, 4),
+                    "tao_out": 0.0,
+                }
+
         logger.info(
             f"EMA[{self._cfg.tag}] EXIT: netuid={pos.netuid}, reason={reason}",
             data={
@@ -436,8 +476,29 @@ class EmaManager:
             return None
 
         if swap.success:
+            total_received = swap.received_tao
+            my_received = total_received  # default: all mine
+
+            # Notify companion strategy: unstake_all consumed ALL alpha for
+            # this coldkey+hotkey+netuid, so the other strategy's position is
+            # now a ghost.  Split the received TAO proportionally and close both.
+            companion_amount_tao: float = 0.0
+            if self._companion_exit_cb is not None:
+                try:
+                    companion_amount_tao = await self._companion_exit_cb(
+                        pos.netuid, total_received, cur,
+                        exiter_amount_tao=pos.amount_tao,
+                    ) or 0.0
+                except Exception as cb_err:
+                    logger.warning(f"Companion exit callback failed SN{pos.netuid}: {cb_err}")
+
+            # If a companion position existed, adjust our share proportionally
+            if companion_amount_tao > 0:
+                total_deployed = pos.amount_tao + companion_amount_tao
+                my_received = pos.amount_tao / total_deployed * total_received
+
             # PnL based on actual TAO returned vs TAO deployed
-            actual_pnl_tao = swap.received_tao - pos.amount_tao
+            actual_pnl_tao = my_received - pos.amount_tao
 
             # Use price-based PnL% (excludes emission yield) so it matches
             # what Taostats shows and what stop-loss/take-profit conditions check.
@@ -447,36 +508,38 @@ class EmaManager:
             exit_alpha = swap.received_alpha if swap.received_alpha > 0 else pos.amount_alpha
             expected_tao_out = exit_alpha * cur
             exit_slippage_pct = (
-                (expected_tao_out - swap.received_tao) / expected_tao_out * 100
+                (expected_tao_out - my_received) / expected_tao_out * 100
                 if expected_tao_out > 0 else None
             )
             await self._db.close_ema_position(
                 position_id=pos.position_id,
                 exit_price=cur,
-                amount_tao_out=swap.received_tao,
+                amount_tao_out=my_received,
                 pnl_tao=actual_pnl_tao,
                 pnl_pct=actual_pnl_pct,
                 exit_reason=reason,
                 exit_slippage_pct=exit_slippage_pct,
             )
             self._realized_pnl += actual_pnl_tao
+            expires = utc_now() + timedelta(hours=self._cfg.cooldown_hours)
             async with self._state_lock:
                 self._open = [p for p in self._open if p.position_id != pos.position_id]
-                self._cooldowns[pos.netuid] = utc_now() + timedelta(hours=self._cfg.cooldown_hours)
+                self._cooldowns[pos.netuid] = expires
+            await self._db.set_cooldown(self._cfg.tag, pos.netuid, expires.isoformat())
             # Emission yield: extra alpha accumulated beyond entry alpha
             emission_tao = (exit_alpha - pos.amount_alpha) * cur if exit_alpha > pos.amount_alpha else 0.0
             yield_note = f" (incl ~{emission_tao:.4f} τ emissions)" if emission_tao > 0.01 else ""
             await send_alert(
                 f"📉 <b>[{self._cfg.tag.upper()}] EXIT {reason}</b>: SN{pos.netuid} | "
                 f"Price {actual_pnl_pct:+.2f}% | {actual_pnl_tao:+.4f} τ{yield_note} | "
-                f"{swap.received_tao:.4f} τ out"
+                f"{my_received:.4f} τ out"
             )
             return {
                 "netuid": pos.netuid,
                 "reason": reason,
                 "pnl_pct": round(actual_pnl_pct, 2),
                 "pnl_tao": round(actual_pnl_tao, 4),
-                "tao_out": swap.received_tao,
+                "tao_out": my_received,
             }
         return None
 
@@ -622,6 +685,61 @@ class EmaManager:
         finally:
             await self._release_exit(pos.position_id)
 
+    # ── Companion exit (cross-strategy ghost resolution) ────────
+
+    async def on_companion_exit(
+        self, netuid: int, total_received_tao: float, exit_price: float,
+        exiter_amount_tao: float = 0.0,
+    ) -> float:
+        """Called by the other strategy after it exits a dual-held subnet.
+
+        Closes this strategy's position for the same netuid using a
+        proportional share of the total TAO received on-chain.
+
+        Returns this position's amount_tao if a companion was found (so the
+        caller can adjust its own PnL), or 0.0 if no companion position existed.
+        """
+        pos = None
+        async with self._state_lock:
+            pos = next((p for p in self._open if p.netuid == netuid), None)
+        if pos is None:
+            return 0.0
+
+        # Proportional share: my_tao / (my_tao + exiter_tao) * total
+        total_deployed = pos.amount_tao + exiter_amount_tao
+        if total_deployed > 0:
+            my_share = pos.amount_tao / total_deployed * total_received_tao
+        else:
+            my_share = 0.0
+        pnl_tao = my_share - pos.amount_tao
+        pnl_pct = pnl_tao / pos.amount_tao * 100 if pos.amount_tao > 0 else 0.0
+
+        await self._db.close_ema_position(
+            position_id=pos.position_id,
+            exit_price=exit_price,
+            amount_tao_out=my_share,
+            pnl_tao=pnl_tao,
+            pnl_pct=pnl_pct,
+            exit_reason="COMPANION_EXIT",
+        )
+        self._realized_pnl += pnl_tao
+        expires = utc_now() + timedelta(hours=self._cfg.cooldown_hours)
+        async with self._state_lock:
+            self._open = [p for p in self._open if p.position_id != pos.position_id]
+            self._cooldowns[pos.netuid] = expires
+        await self._db.set_cooldown(self._cfg.tag, pos.netuid, expires.isoformat())
+
+        logger.warning(
+            f"EMA[{self._cfg.tag}] COMPANION_EXIT SN{netuid}: "
+            f"pnl={pnl_tao:+.4f} τ ({pnl_pct:+.1f}%)"
+        )
+        await send_alert(
+            f"🤝 <b>[{self._cfg.tag.upper()}] COMPANION EXIT</b>: SN{netuid} | "
+            f"{pnl_tao:+.4f} τ ({pnl_pct:+.1f}%) | "
+            f"Closed because other strategy exited same subnet"
+        )
+        return pos.amount_tao
+
     # ── Circuit breaker ─────────────────────────────────────────
 
     @property
@@ -687,7 +805,8 @@ class EmaManager:
 
     def get_portfolio_summary(self, alpha_prices: dict[int, float]) -> dict:
         deployed = sum(p.amount_tao for p in self._open)
-        unstaked = max(0.0, self._cfg.pot_tao + self._realized_pnl - deployed)
+        raw_pot = self._cfg.pot_tao + self._realized_pnl
+        unstaked = max(0.0, raw_pot - deployed)
         open_positions = []
         for p in self._open:
             cur = alpha_prices.get(p.netuid, p.entry_price)
@@ -705,7 +824,7 @@ class EmaManager:
                 "entry_ts": p.entry_ts,
                 "hours_held": round(hours, 1),
             })
-        actual_pot = self._cfg.pot_tao + self._realized_pnl
+        actual_pot = deployed + unstaked  # always satisfies pot = deployed + unstaked
         return {
             "tag": self._cfg.tag,
             "fast_period": self._cfg.fast_period,

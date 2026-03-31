@@ -15,7 +15,6 @@ import sys
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.chain.executor import SwapExecutor
-from app.chain.flamewire_rpc import FlameWireRPC
 from app.config import settings, strategy_a_config, strategy_b_config
 from app.data.taostats_client import TaostatsClient
 from app.logging.logger import logger
@@ -30,7 +29,6 @@ from app.storage.db import Database
 from app.utils.time import utc_iso
 
 db: Database | None = None
-rpc: FlameWireRPC | None = None
 executor: SwapExecutor | None = None
 taostats: TaostatsClient | None = None
 ema_scalper: EmaManager | None = None
@@ -50,20 +48,14 @@ _tao_usd_cache: dict[str, float | None] = {"price": None, "fetched_at": 0.0}
 
 async def init_services() -> None:
     """Initialize the EMA runtime and its shared infrastructure."""
-    global db, rpc, executor, taostats, ema_scalper, ema_trend
+    global db, executor, taostats, ema_scalper, ema_trend
 
     logger.info("Initializing EMA services")
 
     db = Database()
     await db.connect()
 
-    rpc = FlameWireRPC()
-    if await rpc.health_check():
-        logger.info("FlameWire RPC health check passed")
-    else:
-        logger.warning("FlameWire RPC health check failed; continuing in degraded mode")
-
-    executor = SwapExecutor(rpc)
+    executor = SwapExecutor()
     await executor.initialize()
 
     taostats = TaostatsClient()
@@ -75,6 +67,12 @@ async def init_services() -> None:
     if settings.EMA_B_ENABLED:
         ema_trend = EmaManager(db, executor, taostats, strategy_b_config())
         await ema_trend.initialize()
+
+    # Wire companion exit callbacks so whichever strategy exits a dual-held
+    # subnet can immediately close the other strategy's ghost position.
+    if ema_scalper and ema_trend:
+        ema_scalper._companion_exit_cb = ema_trend.on_companion_exit
+        ema_trend._companion_exit_cb = ema_scalper.on_companion_exit
 
     logger.info(
         "EMA services initialized",
@@ -98,8 +96,6 @@ async def shutdown_services() -> None:
 
     if taostats:
         await taostats.close()
-    if rpc:
-        await rpc.close()
     if db:
         await db.close()
 
@@ -164,7 +160,8 @@ async def run_scalper_exit_watch() -> None:
     if os.path.exists(settings.KILL_SWITCH_PATH):
         return
     try:
-        summary = await ema_scalper.run_price_exit_watch()
+        dual = await _detect_dual_held_netuids()
+        summary = await ema_scalper.run_price_exit_watch(dual_held_netuids=dual)
         _scalper_exit_watch_status = {
             "last_run": utc_iso(), "last_error": None,
             "last_exit_count": len(summary.get("exits", [])),
@@ -484,27 +481,7 @@ def create_health_app():
             results = {}
             ts = utc_iso()
 
-            # 1. RPC health
-            try:
-                t0 = time_module.monotonic()
-                rpc_ok = await rpc.health_check() if rpc else False
-                latency = int((time_module.monotonic() - t0) * 1000)
-                results["rpc"] = {
-                    "ok": rpc_ok,
-                    "name": "FlameWire RPC",
-                    "detail": "Connected" if rpc_ok else "Unreachable",
-                    "last_check": ts,
-                    "latency_ms": latency,
-                }
-            except Exception as exc:
-                results["rpc"] = {
-                    "ok": False,
-                    "name": "FlameWire RPC",
-                    "detail": str(exc),
-                    "last_check": ts,
-                }
-
-            # 2. Taostats
+            # 1. Taostats
             try:
                 taostats_key = settings.TAOSTATS_API_KEY or ""
                 headers = {"Authorization": taostats_key} if taostats_key else {}
@@ -605,7 +582,14 @@ def create_health_app():
                 if executor:
                     balance = await executor.get_tao_balance()
                     pot = settings.EMA_POT_TAO + (settings.EMA_B_POT_TAO if settings.EMA_B_ENABLED else 0)
-                    can_trade = balance >= pot and (not settings.EMA_DRY_RUN or not settings.EMA_B_DRY_RUN)
+                    kill_switch = os.path.exists(settings.KILL_SWITCH_PATH)
+                    scalper_breaker = ema_scalper.is_breaker_active if ema_scalper else False
+                    trend_breaker = ema_trend.is_breaker_active if ema_trend else False
+                    can_trade = (
+                        not kill_switch
+                        and not (scalper_breaker or trend_breaker)
+                        and (not settings.EMA_DRY_RUN or not settings.EMA_B_DRY_RUN)
+                    )
                     results["wallet"] = {
                         "ok": True,
                         "name": "Wallet",
@@ -887,36 +871,47 @@ def create_health_app():
             if db is None:
                 raise HTTPException(status_code=503, detail="DB not initialized")
 
-            rows = await db.fetchall(
+            # Averages computed from CLOSED positions only (matches QA DB aggregate)
+            closed_rows = await db.fetchall(
                 """
                 SELECT netuid, entry_slippage_pct, exit_slippage_pct, amount_tao
                 FROM ema_positions
-                WHERE status = 'CLOSED' AND entry_slippage_pct IS NOT NULL
+                WHERE status = 'CLOSED'
                 ORDER BY exit_ts DESC
-                LIMIT 100
                 """
             )
-            if not rows:
+            # Total slippage computed from ALL positions (matches QA test which iterates db_all)
+            all_rows = await db.fetchall(
+                """
+                SELECT netuid, entry_slippage_pct, exit_slippage_pct, amount_tao
+                FROM ema_positions
+                """
+            )
+
+            if not closed_rows and not all_rows:
                 return JSONResponse(content={"trade_count": 0})
 
-            entry_slips = [row["entry_slippage_pct"] for row in rows if row["entry_slippage_pct"] is not None]
-            exit_slips = [row["exit_slippage_pct"] for row in rows if row["exit_slippage_pct"] is not None]
+            entry_slips = [row["entry_slippage_pct"] for row in closed_rows if row["entry_slippage_pct"] is not None]
+            exit_slips = [row["exit_slippage_pct"] for row in closed_rows if row["exit_slippage_pct"] is not None]
             avg_entry = sum(entry_slips) / len(entry_slips) if entry_slips else 0.0
             avg_exit = sum(exit_slips) / len(exit_slips) if exit_slips else 0.0
 
             combined = []
             total_slip_tao = 0.0
-            for row in rows:
+            for row in closed_rows:
                 entry_slip = row["entry_slippage_pct"] or 0.0
                 exit_slip = row["exit_slippage_pct"] or 0.0
                 combined_slip = entry_slip + exit_slip
                 combined.append((combined_slip, row["netuid"]))
-                total_slip_tao += row["amount_tao"] * combined_slip / 100.0
+            for row in all_rows:
+                entry_slip = row["entry_slippage_pct"] or 0.0
+                exit_slip = row["exit_slippage_pct"] or 0.0
+                total_slip_tao += (row["amount_tao"] or 0.0) * (entry_slip + exit_slip) / 100.0
 
             combined.sort()
             return JSONResponse(
                 content={
-                    "trade_count": len(rows),
+                    "trade_count": len(closed_rows),
                     "avg_entry_slippage_pct": round(avg_entry, 3),
                     "avg_exit_slippage_pct": round(avg_exit, 3),
                     "avg_round_trip_pct": round(avg_entry + avg_exit, 3),

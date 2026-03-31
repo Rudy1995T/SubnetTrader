@@ -68,12 +68,6 @@ function useCountdown(nextCycle: string | null): string {
 // ── Error help messages ──────────────────────────────────────────────────────
 
 const ERROR_HELP: Record<string, Record<string, string>> = {
-  rpc: {
-    Unreachable:
-      "Check your internet connection and FLAMEWIRE_API_KEY. The bot will fall back to the public subtensor endpoint.",
-    default:
-      "FlameWire is slow to respond. Trading will continue but may be delayed.",
-  },
   taostats: {
     "HTTP 401": "Your Taostats API key is invalid or expired. Update it in Settings.",
     default: "Taostats API is down. The bot cannot fetch subnet data until it recovers.",
