@@ -32,6 +32,11 @@ KILL_SWITCH
 .DS_Store
 Thumbs.db
 
+# Frontend build artifacts
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+frontend/node_modules/
+
 # Testing
 .pytest_cache/
 htmlcov/

@@ -212,6 +212,129 @@ def bullish_ema_bounce(
     return True
 
 
+def compute_mtf_signal(
+    candles_lower: list[Candle],
+    fast_period: int,
+    slow_period: int,
+    confirm_bars: int,
+) -> dict:
+    """Compute lower-timeframe EMA confirmation signal.
+
+    Returns dict with lower_tf_bullish, EMA values, and bars_above count.
+    """
+    prices = [c.close for c in candles_lower]
+    if len(prices) < max(fast_period, slow_period):
+        return {
+            "lower_tf_bullish": False,
+            "lower_tf_ema_fast": 0.0,
+            "lower_tf_ema_slow": 0.0,
+            "lower_tf_bars_above": 0,
+        }
+    ema_fast = compute_ema(prices, fast_period)
+    ema_slow = compute_ema(prices, slow_period)
+    # Count consecutive bars from the end where fast > slow
+    bars_above = 0
+    for f, s in zip(reversed(ema_fast), reversed(ema_slow)):
+        if f > s:
+            bars_above += 1
+        else:
+            break
+    return {
+        "lower_tf_bullish": bars_above >= confirm_bars,
+        "lower_tf_ema_fast": round(ema_fast[-1], 8) if ema_fast else 0.0,
+        "lower_tf_ema_slow": round(ema_slow[-1], 8) if ema_slow else 0.0,
+        "lower_tf_bars_above": bars_above,
+    }
+
+
+def build_candles_from_history(
+    history: list[dict],
+    candle_hours: int = 4,
+) -> list[Candle]:
+    """Build OHLC candles from per-subnet history data (fixed-interval).
+
+    Unlike build_sampled_candles() which handles irregular seven_day_prices,
+    this works with fixed-interval data points from the history endpoint and
+    produces higher-quality candles.
+
+    Gaps (missing intervals) are skipped — no forward-fill.
+    A warning is logged if >10% of expected candles are missing.
+    """
+    parsed: list[tuple[datetime, float]] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        raw_ts = entry.get("timestamp") or entry.get("t")
+        raw_price = entry.get("price", entry.get("close", entry.get("alpha_price")))
+        if raw_ts in (None, "") or raw_price in (None, ""):
+            continue
+        try:
+            ts = _parse_point_ts(str(raw_ts))
+            price = float(raw_price)
+        except Exception:
+            continue
+        parsed.append((ts, price))
+
+    if not parsed:
+        return []
+
+    parsed.sort(key=lambda item: item[0])
+    candle_sec = candle_hours * 3600
+
+    # Group samples into candle buckets by flooring to candle boundary
+    buckets: dict[int, list[tuple[datetime, float]]] = {}
+    for ts, price in parsed:
+        epoch = int(ts.timestamp())
+        bucket_start = (epoch // candle_sec) * candle_sec
+        buckets.setdefault(bucket_start, []).append((ts, price))
+
+    # Check for missing candles
+    if len(buckets) >= 2:
+        sorted_keys = sorted(buckets)
+        expected = (sorted_keys[-1] - sorted_keys[0]) // candle_sec + 1
+        if expected > 0:
+            missing_pct = (expected - len(buckets)) / expected * 100
+            if missing_pct > 10:
+                from app.logging.logger import logger
+                logger.warning(
+                    f"History candles: {missing_pct:.0f}% missing "
+                    f"({len(buckets)}/{expected} present, {candle_hours}h tf)"
+                )
+
+    candles: list[Candle] = []
+    prior_close: float | None = None
+    for bucket_start in sorted(buckets):
+        samples = sorted(buckets[bucket_start], key=lambda item: item[0])
+        sample_prices = [price for _, price in samples]
+        open_price = prior_close if prior_close is not None else sample_prices[0]
+        close_price = sample_prices[-1]
+        high_price = max(open_price, *sample_prices)
+        low_price = min(open_price, *sample_prices)
+        start_dt = datetime.fromtimestamp(bucket_start, tz=timezone.utc)
+        end_dt = start_dt + timedelta(hours=candle_hours)
+        candles.append(
+            Candle(
+                start_ts=start_dt.isoformat(),
+                end_ts=end_dt.isoformat(),
+                open=open_price,
+                high=high_price,
+                low=low_price,
+                close=close_price,
+                sample_count=len(sample_prices),
+            )
+        )
+        prior_close = close_price
+
+    # Drop last candle if it's still in progress (not yet closed)
+    if candles:
+        now = datetime.now(timezone.utc)
+        last_end = _parse_point_ts(candles[-1].end_ts)
+        if last_end > now:
+            candles.pop()
+
+    return candles
+
+
 def candle_close_prices(candles: list[Candle]) -> list[float]:
     """Extract closes from candle data."""
     return [c.close for c in candles]

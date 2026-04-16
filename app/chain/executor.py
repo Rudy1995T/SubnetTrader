@@ -359,6 +359,7 @@ class SwapExecutor:
         max_slippage_pct: float | None = None,
         dry_run: bool | None = None,
         hotkey_ss58: str | None = None,
+        alpha_in_pool_override: float | None = None,
     ) -> SwapResult:
         """
         Execute an actual swap on-chain.
@@ -419,7 +420,8 @@ class SwapExecutor:
         # LIVE execution
         try:
             tx_hash, alpha_received, tao_received = await self._submit_swap(
-                origin_netuid, destination_netuid, amount_rao, hotkey_ss58
+                origin_netuid, destination_netuid, amount_rao, hotkey_ss58,
+                alpha_in_pool_override=alpha_in_pool_override,
             )
             # For exits (destination=0), use actual balance delta as received_tao.
             # For entries (origin=0), use quote estimate (tao_received is 0).
@@ -478,7 +480,8 @@ class SwapExecutor:
                 try:
                     await self._reconnect_substrate()
                     tx_hash, alpha_received, tao_received = await self._submit_swap(
-                        origin_netuid, destination_netuid, tao_to_rao(amount_tao), hotkey_ss58
+                        origin_netuid, destination_netuid, tao_to_rao(amount_tao), hotkey_ss58,
+                        alpha_in_pool_override=alpha_in_pool_override,
                     )
                     actual_received_tao = tao_received if tao_received > 0 else quote.expected_out_tao
                     return SwapResult(
@@ -518,6 +521,7 @@ class SwapExecutor:
         destination_netuid: int,
         amount_rao: int,
         hotkey_ss58: str | None = None,
+        alpha_in_pool_override: float | None = None,
     ) -> tuple[str, float, float]:
         """
         Submit the swap extrinsic on-chain using Bittensor SDK.
@@ -607,11 +611,14 @@ class SwapExecutor:
                     # Each chunk should be small enough to keep slippage per chunk < 5%.
                     # For constant-product AMM: price_impact ≈ amount / pool_reserve.
                     # With 5% max tolerance, safe chunk ≈ 5% of the alpha reserve.
-                    from app.data.taostats_client import TaostatsClient
-                    ts_inst = getattr(TaostatsClient, '_instance', None)
-                    pool_snap = ts_inst._pool_snapshot.get(origin_netuid, {}) if ts_inst else {}
-                    # alpha_in_pool is in rao from Taostats; convert to token units
-                    alpha_in_pool = float(pool_snap.get("alpha_in_pool", 0) or 0) / 1e9
+                    if alpha_in_pool_override is not None and alpha_in_pool_override > 0:
+                        alpha_in_pool = alpha_in_pool_override
+                    else:
+                        from app.data.taostats_client import TaostatsClient
+                        ts_inst = getattr(TaostatsClient, '_instance', None)
+                        pool_snap = ts_inst._pool_snapshot.get(origin_netuid, {}) if ts_inst else {}
+                        # alpha_in_pool is in rao from Taostats; convert to token units
+                        alpha_in_pool = float(pool_snap.get("alpha_in_pool", 0) or 0) / 1e9
 
                     if alpha_in_pool > 0 and alpha_float > 0:
                         # Safe chunk = rate_tol fraction of pool reserve
@@ -720,10 +727,16 @@ class SwapExecutor:
             tx_hash, alpha_received, tao_received = await asyncio.get_event_loop().run_in_executor(None, _do_swap)
         return tx_hash, alpha_received, tao_received
 
-    async def get_onchain_stake(self, hotkey_ss58: str, netuid: int) -> float:
-        """Return the coldkey's alpha stake for a given hotkey+netuid (0.0 if unavailable)."""
+    async def get_onchain_stake(self, hotkey_ss58: str, netuid: int) -> float | None:
+        """Return the coldkey's alpha stake for a given hotkey+netuid.
+
+        Returns None if the chain cannot be queried (substrate not ready,
+        RPC error, etc.) so callers can distinguish "confirmed zero" from
+        "unable to check".
+        """
         if self._substrate is None or self._wallet is None:
-            return 0.0
+            logger.warning(f"get_onchain_stake SN{netuid}: substrate not ready, returning None")
+            return None
 
         def _query() -> float:
             bal = self._substrate.get_stake(
@@ -738,7 +751,7 @@ class SwapExecutor:
                 return await asyncio.get_running_loop().run_in_executor(None, _query)
         except Exception as e:
             logger.warning(f"get_onchain_stake SN{netuid} failed: {e}")
-            return 0.0
+            return None
 
     async def get_tao_balance(self) -> float:
         """Get the coldkey's free TAO balance (used for staking)."""
@@ -810,3 +823,83 @@ class SwapExecutor:
                 except Exception:
                     pass
             return 0.0
+
+    async def ensure_root_claim_keep(self) -> bool:
+        """Set root claim type to 'Keep' so emissions accumulate as alpha.
+
+        Returns True if already set or successfully changed, False on error.
+        """
+        if self._substrate is None or self._wallet is None:
+            logger.warning("ensure_root_claim_keep: substrate/wallet not ready")
+            return False
+
+        def _set() -> bool:
+            coldkey = self._wallet.coldkey.ss58_address
+            current = self._substrate.get_root_claim_type(coldkey_ss58=coldkey)
+            current_str = str(current)
+            if "Keep" in current_str and "KeepSubnets" not in current_str:
+                logger.info(f"Root claim type already 'Keep': {current_str}")
+                return True
+            logger.info(f"Setting root claim type to 'Keep' (was: {current_str})")
+            result = self._substrate.set_root_claim_type(
+                wallet=self._wallet,
+                new_root_claim_type="Keep",
+                wait_for_inclusion=True,
+                wait_for_finalization=True,
+            )
+            if hasattr(result, "success") and not result.success:
+                logger.error(f"set_root_claim_type failed: {getattr(result, 'message', result)}")
+                return False
+            logger.info("Root claim type set to 'Keep'")
+            return True
+
+        try:
+            async with self._substrate_lock:
+                return await asyncio.get_running_loop().run_in_executor(None, _set)
+        except Exception as e:
+            logger.error(f"ensure_root_claim_keep error: {e}")
+            return False
+
+    async def claim_root_emissions(self, netuids: list[int]) -> bool:
+        """Claim accumulated root emissions for the given netuids.
+
+        The SDK allows up to 5 netuids per call; this method batches
+        automatically if more are provided.
+        Returns True if all batches succeeded, False otherwise.
+        """
+        if self._substrate is None or self._wallet is None:
+            logger.warning("claim_root_emissions: substrate/wallet not ready")
+            return False
+        if not netuids:
+            logger.debug("claim_root_emissions: no netuids to claim")
+            return True
+
+        def _claim(batch: list[int]) -> bool:
+            result = self._substrate.claim_root(
+                wallet=self._wallet,
+                netuids=batch,
+                wait_for_inclusion=True,
+                wait_for_finalization=False,
+            )
+            if hasattr(result, "success") and not result.success:
+                logger.error(
+                    f"claim_root failed for netuids {batch}: "
+                    f"{getattr(result, 'message', result)}"
+                )
+                return False
+            logger.info(f"Root emissions claimed for netuids {batch}")
+            return True
+
+        all_ok = True
+        # Batch in groups of 5 (SDK limit)
+        for i in range(0, len(netuids), 5):
+            batch = netuids[i : i + 5]
+            try:
+                async with self._substrate_lock:
+                    ok = await asyncio.get_running_loop().run_in_executor(None, _claim, batch)
+                if not ok:
+                    all_ok = False
+            except Exception as e:
+                logger.error(f"claim_root_emissions error for {batch}: {e}")
+                all_ok = False
+        return all_ok

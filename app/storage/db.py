@@ -46,6 +46,16 @@ class Database:
             "ALTER TABLE ema_positions ADD COLUMN entry_slippage_pct REAL DEFAULT NULL",
             "ALTER TABLE ema_positions ADD COLUMN exit_slippage_pct REAL DEFAULT NULL",
             "ALTER TABLE ema_positions ADD COLUMN strategy TEXT DEFAULT 'scalper'",
+            "ALTER TABLE ema_positions ADD COLUMN exit_verified BOOLEAN DEFAULT NULL",
+            "ALTER TABLE ema_positions ADD COLUMN exit_verified_at TEXT DEFAULT NULL",
+            "ALTER TABLE ema_positions ADD COLUMN tao_recovered REAL DEFAULT 0",
+            "ALTER TABLE ema_positions ADD COLUMN emission_alpha REAL DEFAULT 0",
+            "ALTER TABLE ema_positions ADD COLUMN emission_tao REAL DEFAULT 0",
+            "ALTER TABLE ema_positions ADD COLUMN current_alpha REAL DEFAULT NULL",
+            "ALTER TABLE ema_positions ADD COLUMN emission_updated_at TEXT DEFAULT NULL",
+            "ALTER TABLE ema_positions ADD COLUMN scaled_out INTEGER DEFAULT 0",
+            "ALTER TABLE ema_positions ADD COLUMN scaled_out_ts TEXT DEFAULT NULL",
+            "ALTER TABLE ema_positions ADD COLUMN partial_pnl_tao REAL DEFAULT 0.0",
         ):
             try:
                 await self._conn.execute(statement)
@@ -202,6 +212,88 @@ class Database:
         )
         from app.utils.time import parse_iso as _parse_iso
         return {r["netuid"]: _parse_iso(r["expires_at"]) for r in rows}
+
+    async def update_emission_snapshot(
+        self,
+        position_id: int,
+        current_alpha: float,
+        emission_alpha: float,
+        emission_tao: float,
+    ) -> None:
+        await self.execute(
+            """
+            UPDATE ema_positions
+            SET current_alpha = ?,
+                emission_alpha = ?,
+                emission_tao = ?,
+                emission_updated_at = ?
+            WHERE id = ?
+            """,
+            (current_alpha, emission_alpha, emission_tao, utc_iso(), position_id),
+        )
+
+    async def update_exit_emission(
+        self,
+        position_id: int,
+        emission_alpha: float,
+        emission_tao: float,
+    ) -> None:
+        await self.execute(
+            """
+            UPDATE ema_positions
+            SET emission_alpha = ?,
+                emission_tao = ?
+            WHERE id = ?
+            """,
+            (emission_alpha, emission_tao, position_id),
+        )
+
+    async def update_exit_verified(self, position_id: int, verified: bool) -> None:
+        await self.execute(
+            "UPDATE ema_positions SET exit_verified = ?, exit_verified_at = ? WHERE id = ?",
+            (verified, utc_iso(), position_id),
+        )
+
+    async def update_exit_tao_recovered(self, position_id: int, tao_recovered: float) -> None:
+        await self.execute(
+            """
+            UPDATE ema_positions
+            SET tao_recovered = COALESCE(tao_recovered, 0) + ?,
+                amount_tao_out = COALESCE(amount_tao_out, 0) + ?
+            WHERE id = ?
+            """,
+            (tao_recovered, tao_recovered, position_id),
+        )
+
+    async def update_partial_exit(
+        self,
+        position_id: int,
+        new_amount_alpha: float,
+        partial_pnl_tao: float,
+        scaled_out_ts: str,
+    ) -> None:
+        await self.execute(
+            """
+            UPDATE ema_positions
+            SET scaled_out = 1,
+                scaled_out_ts = ?,
+                partial_pnl_tao = ?,
+                amount_alpha = ?
+            WHERE id = ?
+            """,
+            (scaled_out_ts, partial_pnl_tao, new_amount_alpha, position_id),
+        )
+
+    async def update_position_status(self, position_id: int, status: str) -> None:
+        await self.execute(
+            "UPDATE ema_positions SET status = ? WHERE id = ?",
+            (status, position_id),
+        )
+
+    async def get_unverified_exits(self) -> list[dict]:
+        return await self.fetchall(
+            "SELECT * FROM ema_positions WHERE exit_verified IS NULL AND status = 'CLOSED'"
+        )
 
     async def clear_ema_history(self) -> None:
         await self.execute("DELETE FROM ema_positions")

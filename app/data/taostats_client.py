@@ -27,6 +27,8 @@ class CacheEntry:
 class TaostatsClient:
     """Async Taostats API wrapper with cache and rate limiter."""
 
+    _HISTORY_CACHE_MAX = 50  # LRU eviction threshold
+
     def __init__(self) -> None:
         self._base = settings.TAOSTATS_BASE_URL.rstrip("/")
         self._api_key = settings.TAOSTATS_API_KEY
@@ -38,6 +40,13 @@ class TaostatsClient:
         self._client: httpx.AsyncClient | None = None
         # Per-cycle pool snapshot keyed by netuid, populated by get_alpha_prices.
         self._pool_snapshot: dict[int, dict] = {}
+        # Previous cycle's snapshot for pool delta detection (Gini force-refresh).
+        self._prev_pool_snapshot: dict[int, dict] = {}
+        # Per-subnet history cache: netuid → (fetched_at, data)
+        self._history_cache: dict[int, tuple[float, list[dict]]] = {}
+        self._history_ttl = settings.SUBNET_HISTORY_CACHE_TTL_SEC
+        # Asyncio event signalled when pool snapshot refreshes (for SSE price feed).
+        self._price_updated: asyncio.Event = asyncio.Event()
         # Store singleton reference so executor can access pool depth.
         TaostatsClient._instance = self
 
@@ -107,17 +116,30 @@ class TaostatsClient:
 
     # ── Public API methods ─────────────────────────────────────────
 
-    async def get_alpha_prices(self) -> dict[int, float]:
+    async def get_alpha_prices(
+        self, include_raw: bool = False
+    ) -> "dict[int, float] | tuple[dict[int, float], dict[int, list]]":
         """
         Fetch alpha token prices for all subnets in one call.
         Populates the pool snapshot so get_price_history needs no extra API calls.
-        Returns {netuid: price_in_tao}.
+
+        Args:
+            include_raw: If True, also return {netuid: seven_day_prices} as second element.
+
+        Returns:
+            {netuid: price_in_tao}, or ({netuid: price_in_tao}, {netuid: seven_day_prices})
+            if include_raw=True.
         """
         data = await self._get("/api/dtao/pool/latest/v1", params={"limit": 200})
         items = data.get("data", []) if isinstance(data, dict) else []
 
+        # Rotate snapshot: save previous for pool delta detection
+        self._prev_pool_snapshot = self._pool_snapshot.copy()
         # Cache full records for get_price_history to reuse
         self._pool_snapshot = {int(s["netuid"]): s for s in items if "netuid" in s}
+
+        # Signal SSE price feed that snapshot has been refreshed.
+        self._price_updated.set()
 
         prices: dict[int, float] = {}
         for subnet in items:
@@ -128,6 +150,15 @@ class TaostatsClient:
                     prices[netuid] = price
             except (ValueError, TypeError):
                 continue
+
+        if include_raw:
+            raw_prices: dict[int, list] = {
+                int(s["netuid"]): s.get("seven_day_prices", [])
+                for s in items
+                if "netuid" in s
+            }
+            return prices, raw_prices
+
         return prices
 
     async def get_price_history(
@@ -155,3 +186,137 @@ class TaostatsClient:
         except Exception:
             logger.warning(f"No price history available for netuid {netuid}")
             return []
+
+    async def get_subnet_history(
+        self,
+        netuid: int,
+        interval: str = "1h",
+        limit: int = 336,
+    ) -> list[dict]:
+        """Fetch per-subnet price history from /api/dtao/pool/history/v1.
+
+        Returns list of dicts with at least {timestamp, price}.
+        Results are cached per netuid with independent TTL.
+        Falls back to seven_day_prices if the history endpoint fails.
+        """
+        now = time.time()
+        cached = self._history_cache.get(netuid)
+        if cached is not None:
+            ts, data = cached
+            if (now - ts) < self._history_ttl:
+                return data
+
+        try:
+            resp = await self._get(
+                "/api/dtao/pool/history/v1",
+                params={"netuid": netuid, "interval": interval, "limit": limit},
+            )
+            # Normalise: API may wrap in {"data": [...]}
+            if isinstance(resp, dict):
+                resp = resp.get("data", [])
+            if not isinstance(resp, list):
+                resp = []
+
+            # Validate each entry has at least a price
+            validated: list[dict] = []
+            for entry in resp:
+                if isinstance(entry, dict) and entry.get("price") is not None:
+                    validated.append(entry)
+
+            if validated:
+                self._history_cache[netuid] = (now, validated)
+                self._evict_history_cache()
+                return validated
+
+            logger.warning(
+                f"Subnet history empty/invalid for SN{netuid}, falling back to seven_day_prices"
+            )
+        except Exception as exc:
+            logger.warning(f"Subnet history fetch failed for SN{netuid}: {exc}")
+
+        # Graceful fallback to seven_day_prices from pool snapshot
+        if netuid in self._pool_snapshot:
+            seven_day = self._pool_snapshot[netuid].get("seven_day_prices", [])
+            if seven_day:
+                return seven_day[-limit:]
+        return []
+
+    async def get_fresh_pool(self, netuid: int) -> dict | None:
+        """Fetch the latest pool reserves for a single subnet.
+
+        Bypasses the bulk snapshot cache to give a just-in-time read.
+        Returns the same dict shape as _pool_snapshot[netuid] or None on failure.
+        """
+        try:
+            # Try single-subnet filter first; fall back to bulk if API ignores it.
+            await self._wait_for_slot()
+            client = await self._get_client()
+            resp = await client.get(
+                "/api/dtao/pool/latest/v1",
+                params={"netuid": netuid, "limit": 1},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"get_fresh_pool SN{netuid}: HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+            records = data.get("data") or data.get("subnets") or []
+
+            # Search through all returned records for the target subnet.
+            # API may return just the one subnet or all 200 — handle both.
+            for rec in records:
+                if int(rec.get("netuid", -1)) == netuid:
+                    return rec
+
+            logger.debug(f"get_fresh_pool SN{netuid}: subnet not found in {len(records)} records")
+            return None
+        except Exception as exc:
+            logger.warning(f"get_fresh_pool SN{netuid} failed: {exc}")
+            return None
+
+    # ── Gini support methods ─────────────────────────────────────
+
+    def pool_concentration_alert(
+        self, netuid: int, current_snap: dict, threshold: float = 0.15
+    ) -> bool:
+        """Return True if pool reserves shifted enough to warrant a Gini refresh."""
+        prev = self._prev_pool_snapshot.get(netuid)
+        if not prev:
+            return False
+        prev_alpha = float(prev.get("alpha_in_pool", 0))
+        curr_alpha = float(current_snap.get("alpha_in_pool", 0))
+        if prev_alpha == 0:
+            return False
+        delta_pct = abs(curr_alpha - prev_alpha) / prev_alpha
+        return delta_pct > threshold
+
+    async def get_stake_distribution(self, netuid: int) -> list[float] | None:
+        """Fetch top staker balances from Taostats for Gini computation.
+
+        Returns a list of positive stake values, or None if the endpoint
+        is unavailable or returns no data.
+        """
+        try:
+            data = await self._get(
+                "/api/dtao/stake/latest/v1",
+                params={"netuid": netuid, "limit": 100},
+            )
+            items = data.get("data", []) if isinstance(data, dict) else []
+            stakes = [
+                float(r.get("stake", 0))
+                for r in items
+                if float(r.get("stake", 0)) > 0
+            ]
+            return stakes if stakes else None
+        except Exception as e:
+            logger.debug(f"Taostats stake distribution unavailable for SN{netuid}: {e}")
+            return None
+
+    def _evict_history_cache(self) -> None:
+        """Evict oldest entries when cache exceeds max size."""
+        if len(self._history_cache) <= self._HISTORY_CACHE_MAX:
+            return
+        # Sort by fetched_at ascending, drop oldest
+        by_age = sorted(self._history_cache.items(), key=lambda kv: kv[1][0])
+        to_drop = len(self._history_cache) - self._HISTORY_CACHE_MAX
+        for netuid, _ in by_age[:to_drop]:
+            del self._history_cache[netuid]

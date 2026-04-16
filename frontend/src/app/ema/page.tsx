@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import useSWR from "swr";
+import { usePriceStream } from "@/hooks/usePriceStream";
 
 const API = process.env.NEXT_PUBLIC_API_URL || (typeof window !== "undefined" ? `http://${window.location.hostname}:8081` : "http://localhost:8081");
 const fetcher = (url: string) => fetch(url).then((r) => r.json());
@@ -16,6 +17,20 @@ interface EmaSignal {
   signal_scalper?: "BUY" | "SELL" | "HOLD";
   signal_trend?: "BUY" | "SELL" | "HOLD";
   bars: number;
+  mtf_confirmed?: boolean;
+  mtf_scalper?: boolean;
+  mtf_trend?: boolean;
+  mtf_lower_tf_hours?: number;
+  lower_tf_ema_fast?: number;
+  lower_tf_ema_slow?: number;
+  lower_tf_bars_above?: number;
+  ann_volatility?: number | null;
+  vol_adjusted_size_pct?: number | null;
+  pool_depth_size_pct?: number | null;
+  final_size_pct?: number | null;
+  rsi?: number | null;
+  macd_histogram?: number | null;
+  bb_position?: number | null;
 }
 
 interface StrategyInfo {
@@ -83,6 +98,9 @@ interface DualPortfolioData {
     total_deployed: number;
     total_open: number;
     wallet_balance: number | null;
+    pot_mode?: "fixed" | "wallet_split";
+    fee_reserve_tao?: number;
+    pot_weight?: number;
   };
 }
 
@@ -100,6 +118,8 @@ interface EmaPosition {
   pnl_tao: number | null;
   pnl_pct: number | null;
   exit_reason: string | null;
+  exit_verified: boolean | null;
+  tao_recovered: number | null;
 }
 
 interface SpotData {
@@ -673,7 +693,19 @@ function PositionInsight({
 
 // ── Signal summary bar ────────────────────────────────────────
 
-function SignalBar({ buy, sell, hold }: { buy: number; sell: number; hold: number }) {
+function SignalBar({
+  buy,
+  sell,
+  hold,
+  expanded,
+  onToggle,
+}: {
+  buy: number;
+  sell: number;
+  hold: number;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
   const total = buy + sell + hold;
   if (total === 0) return null;
   const buyPct = (buy / total) * 100;
@@ -682,10 +714,17 @@ function SignalBar({ buy, sell, hold }: { buy: number; sell: number; hold: numbe
 
   return (
     <div className="mb-6">
-      <div className="flex items-center gap-4 mb-2">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex items-center gap-4 mb-2 w-full text-left hover:opacity-80 transition-opacity"
+      >
+        <span className="text-gray-500 text-sm w-3 inline-block">{expanded ? "▾" : "▸"}</span>
         <h2 className="text-lg font-semibold text-indigo-300">EMA Signals</h2>
         <span className="text-xs text-gray-500">{total} subnets scanned</span>
-      </div>
+      </button>
+      {expanded && (
+      <>
       <div className="flex gap-4 mb-2">
         <span className="flex items-center gap-1.5 text-sm">
           <span className="w-3 h-3 rounded-sm bg-emerald-500" />
@@ -726,6 +765,8 @@ function SignalBar({ buy, sell, hold }: { buy: number; sell: number; hold: numbe
           />
         )}
       </div>
+      </>
+      )}
     </div>
   );
 }
@@ -1007,6 +1048,8 @@ export default function EmaPage() {
     ema_period?: number;
     fast_ema_period?: number;
     strategies?: StrategyInfo[];
+    mtf_enabled?: boolean;
+    mtf_lower_tf_hours?: number;
   }>(
     `${API}/api/ema/signals`,
     fetcher,
@@ -1022,10 +1065,18 @@ export default function EmaPage() {
     fetcher,
     { refreshInterval: 15000 }
   );
+  const { data: stuckData } = useSWR<{ stuck: Array<{ netuid: number; strategy: string; remaining_alpha: number; flagged_at: string; hotkey: string }>; count: number }>(
+    `${API}/api/ema/stuck-positions`,
+    fetcher,
+    { refreshInterval: 30000 }
+  );
+  const priceUpdate = usePriceStream();
   const [closingId, setClosingId] = useState<number | null>(null);
   const [confirmId, setConfirmId] = useState<number | null>(null);
   const [closeError, setCloseError] = useState<string | null>(null);
   const [showUsd, setShowUsd] = useState(true);
+  const [signalsExpanded, setSignalsExpanded] = useState(false);
+  const [closedExpanded, setClosedExpanded] = useState(false);
   const [clockMs, setClockMs] = useState(() => Date.now());
   const [toastEvents, setToastEvents] = useState<ExitEvent[]>([]);
   const [exitAnimations, setExitAnimations] = useState<ExitAnimation[]>([]);
@@ -1148,8 +1199,16 @@ export default function EmaPage() {
   const trendClosed = closed.filter((p) => (p as any).strategy === "trend");
   const realizedPnl = closed.reduce((s, p) => s + (p.pnl_tao ?? 0), 0);
   const wins = closed.filter((p) => (p.pnl_pct ?? 0) > 0).length;
-  const unrealizedPnl = allOpenPositions.reduce((s, p) => s + p.amount_tao * (p.pnl_pct / 100), 0);
-  const alphaMarkedValueTao = allOpenPositions.reduce((s, p) => s + (p.amount_alpha ?? 0) * p.current_price, 0);
+  const unrealizedPnl = allOpenPositions.reduce((s, p) => {
+    const lp = priceUpdate?.prices[p.netuid]?.price ?? null;
+    const dp = lp ?? p.current_price;
+    const pnl = p.entry_price > 0 ? ((dp - p.entry_price) / p.entry_price) * 100 : p.pnl_pct;
+    return s + p.amount_tao * (pnl / 100);
+  }, 0);
+  const alphaMarkedValueTao = allOpenPositions.reduce((s, p) => {
+    const dp = priceUpdate?.prices[p.netuid]?.price ?? p.current_price;
+    return s + (p.amount_alpha ?? 0) * dp;
+  }, 0);
   const totalPnl = realizedPnl + unrealizedPnl;
 
   // Both strategies disabled
@@ -1229,6 +1288,23 @@ export default function EmaPage() {
         Two independent EMA strategies — Scalper (fast crosses) and Trend (longer holds) — sharing a single wallet
       </p>
 
+      {/* Stuck positions alert */}
+      {(stuckData?.count ?? 0) > 0 && (
+        <div className="mb-4 p-3 rounded-lg bg-red-950/60 border border-red-700 text-red-300 text-sm flex items-start gap-2">
+          <span className="text-red-400 text-lg leading-none mt-0.5">!</span>
+          <div>
+            <span className="font-bold">{stuckData!.count} stuck position{stuckData!.count > 1 ? "s" : ""}</span>
+            {" — residual alpha remains on-chain after exit retries failed. "}
+            {stuckData!.stuck.map((s) => (
+              <span key={s.netuid} className="inline-block mr-2 font-mono text-xs bg-red-900/40 px-1.5 py-0.5 rounded">
+                SN{s.netuid} ({s.remaining_alpha.toFixed(3)} alpha, {s.strategy})
+              </span>
+            ))}
+            <span className="text-red-400/70 text-xs block mt-1">Manual intervention required</span>
+          </div>
+        </div>
+      )}
+
       {/* Combined summary */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
         <StatCard
@@ -1248,6 +1324,11 @@ export default function EmaPage() {
         <StatCard
           label="Total Pot"
           value={fmtTao(combined?.total_pot, showUsd, taoUsd)}
+          sub={
+            combined?.pot_mode === "wallet_split"
+              ? `Auto: ${Math.round((combined.pot_weight ?? 0.5) * 100)}/${Math.round((1 - (combined.pot_weight ?? 0.5)) * 100)} split · ${combined.fee_reserve_tao ?? 1} τ reserve`
+              : "Fixed mode"
+          }
         />
         <StatCard
           label="Total Deployed"
@@ -1280,54 +1361,8 @@ export default function EmaPage() {
         {trend?.enabled && <StrategyCard port={trend} closed={trendClosed} showUsd={showUsd} taoUsd={taoUsd} />}
       </div>
 
-      {/* Signal clock + rule summary */}
-      {dualData && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-          <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
-            <p className="text-xs text-gray-400 mb-1">Signal Clock</p>
-            <p className="text-xl font-bold text-white">{nextBarCountdown}</p>
-            <p className="text-xs text-gray-500 mt-1">
-              Next bar close: {fmtUtcDate(nextBarClose)}
-            </p>
-            <p className="text-xs text-gray-600 mt-2">
-              Signals only change when a full {signalTimeframeHours}h bar completes.
-            </p>
-          </div>
-          <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
-            <p className="text-xs text-gray-400 mb-1">Scalper Rules</p>
-            <p className="text-sm text-white">
-              EMA({scalper?.fast_period ?? 3}/{scalper?.slow_period ?? 9}) · {scalper?.confirm_bars ?? 3}-bar confirm
-            </p>
-            <p className="text-xs text-gray-500 mt-1">
-              SL {scalper?.stop_loss_pct ?? 8}% · TP {scalper?.take_profit_pct ?? 20}% · Trail {scalper?.trailing_stop_pct ?? 5}%
-            </p>
-          </div>
-          <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
-            <p className="text-xs text-gray-400 mb-1">Trend Rules</p>
-            <p className="text-sm text-white">
-              EMA({trend?.fast_period ?? 3}/{trend?.slow_period ?? 18}) · {trend?.confirm_bars ?? 3}-bar confirm
-            </p>
-            <p className="text-xs text-gray-500 mt-1">
-              SL {trend?.stop_loss_pct ?? 8}% · TP {trend?.take_profit_pct ?? 20}% · Trail {trend?.trailing_stop_pct ?? 5}%
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Breaker alerts */}
-      {(scalper as any)?.breaker_active && (
-        <div className="mb-4 px-4 py-2 rounded-lg bg-red-950 border border-red-700 text-red-300 text-sm font-semibold">
-          Scalper circuit breaker active — entries paused due to drawdown
-        </div>
-      )}
-      {(trend as any)?.breaker_active && (
-        <div className="mb-4 px-4 py-2 rounded-lg bg-red-950 border border-red-700 text-red-300 text-sm font-semibold">
-          Trend circuit breaker active — entries paused due to drawdown
-        </div>
-      )}
-
       {/* Recent trades */}
-      <div className="mb-8">
+      <div className="mb-8" style={{ display: "none" }}>
         <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-sm font-semibold text-gray-300">Recent Trades</h2>
@@ -1474,10 +1509,16 @@ export default function EmaPage() {
                     const pos = card.pos;
                     const stratTag = (pos as any)._strategy ?? "scalper";
                     const posStrat = strategyForPos(stratTag);
+                    const livePrice = priceUpdate?.prices[pos.netuid]?.price ?? null;
+                    const displayPrice = livePrice ?? pos.current_price;
+                    const livePnlPct = pos.entry_price > 0
+                      ? ((displayPrice - pos.entry_price) / pos.entry_price) * 100
+                      : pos.pnl_pct;
+                    const isLive = livePrice !== null;
                     const pnlColor =
-                      pos.pnl_pct >= 0 ? "text-emerald-400" : "text-red-400";
-                    const pnlTao = pos.amount_tao * (pos.pnl_pct / 100);
-                    const closeBtnColor = pos.pnl_pct >= 0
+                      livePnlPct >= 0 ? "text-emerald-400" : "text-red-400";
+                    const pnlTao = pos.amount_tao * (livePnlPct / 100);
+                    const closeBtnColor = livePnlPct >= 0
                       ? "border-emerald-800 text-emerald-400 hover:bg-emerald-900/30"
                       : "border-red-800 text-red-400 hover:bg-red-900/30";
                     return (
@@ -1495,10 +1536,18 @@ export default function EmaPage() {
                             </span>
                           </div>
                           <div className="text-right">
-                            <span className={`text-lg font-bold ${pnlColor}`}>
-                              {pos.pnl_pct >= 0 ? "+" : ""}
-                              {pos.pnl_pct.toFixed(2)}%
-                            </span>
+                            <div className="flex items-center justify-end gap-1.5">
+                              {isLive && (
+                                <span className="relative flex h-2 w-2" title="Live price">
+                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
+                                </span>
+                              )}
+                              <span className={`text-lg font-bold ${pnlColor}`}>
+                                {livePnlPct >= 0 ? "+" : ""}
+                                {livePnlPct.toFixed(2)}%
+                              </span>
+                            </div>
                             <p className={`text-xs ${pnlColor} opacity-75`}>
                               {fmtPnl(pnlTao, showUsd, taoUsd)}
                             </p>
@@ -1530,7 +1579,7 @@ export default function EmaPage() {
                           </div>
                           <div className="text-gray-400">
                             Current{" "}
-                            <span className="text-white">{fmtPrice(pos.current_price, showUsd, taoUsd)}</span>
+                            <span className="text-white">{fmtPrice(displayPrice, showUsd, taoUsd)}</span>
                           </div>
                           <div className="text-gray-400">
                             Invested{" "}
@@ -1558,7 +1607,7 @@ export default function EmaPage() {
                               <span className="text-xs text-gray-300">
                                 Close at{" "}
                                 <span className={pnlColor}>
-                                  {pos.pnl_pct >= 0 ? "+" : ""}{pos.pnl_pct.toFixed(2)}%
+                                  {livePnlPct >= 0 ? "+" : ""}{livePnlPct.toFixed(2)}%
                                 </span>
                                 {" "}(~{fmtPnl(pnlTao, showUsd, taoUsd, 4)})?
                               </span>
@@ -1582,7 +1631,7 @@ export default function EmaPage() {
                               title="Close position"
                             >
                               Close ·{" "}
-                              <span>{pos.pnl_pct >= 0 ? "+" : ""}{pos.pnl_pct.toFixed(2)}%</span>
+                              <span>{livePnlPct >= 0 ? "+" : ""}{livePnlPct.toFixed(2)}%</span>
                               {" "}·{" "}
                               <span>{fmtPnl(pnlTao, showUsd, taoUsd, 4)}</span>
                             </button>
@@ -1599,10 +1648,16 @@ export default function EmaPage() {
       )}
 
       {/* Signal summary bar */}
-      <SignalBar buy={buySignals} sell={sellSignals} hold={holdSignals} />
+      <SignalBar
+        buy={buySignals}
+        sell={sellSignals}
+        hold={holdSignals}
+        expanded={signalsExpanded}
+        onToggle={() => setSignalsExpanded((v) => !v)}
+      />
 
       {/* EMA Signal table */}
-      <div className="mb-10">
+      <div className="mb-10" hidden={!signalsExpanded}>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
@@ -1620,7 +1675,15 @@ export default function EmaPage() {
                 ) : (
                   <th className="pb-2 pr-4">Signal</th>
                 )}
-                <th className="pb-2">Bars</th>
+                {sigData?.mtf_enabled && (
+                  <th className="pb-2 pr-4">{sigData?.mtf_lower_tf_hours ?? 1}h MTF</th>
+                )}
+                <th className="pb-2 pr-4">Bars</th>
+                <th className="pb-2 pr-4">RSI</th>
+                <th className="pb-2 pr-4">MACD</th>
+                <th className="pb-2 pr-4">BB%</th>
+                <th className="pb-2 pr-4">Vol</th>
+                <th className="pb-2">Size</th>
               </tr>
             </thead>
             <tbody>
@@ -1677,8 +1740,55 @@ export default function EmaPage() {
                         <SignalBadge signal={s.signal} />
                       </td>
                     )}
-                    <td className={`py-2 font-mono ${barColor}`}>
+                    {sigData?.mtf_enabled && (
+                      <td className="py-2 pr-4">
+                        {s.mtf_confirmed === undefined ? (
+                          <span className="text-gray-600">—</span>
+                        ) : s.mtf_confirmed ? (
+                          <span className="text-emerald-400 font-medium">✓</span>
+                        ) : (
+                          <span className="text-red-400 font-medium">✗</span>
+                        )}
+                        {s.lower_tf_bars_above !== undefined && (
+                          <span className="text-gray-500 text-xs ml-1">{s.lower_tf_bars_above}b</span>
+                        )}
+                      </td>
+                    )}
+                    <td className={`py-2 pr-4 font-mono ${barColor}`}>
                       {s.bars > 0 ? `+${s.bars}` : s.bars}
+                    </td>
+                    <td className={`py-2 pr-4 font-mono ${
+                      s.rsi != null
+                        ? s.rsi < 30 ? "text-emerald-400" : s.rsi > 70 ? "text-red-400" : "text-gray-300"
+                        : "text-gray-600"
+                    }`}>
+                      {s.rsi != null ? s.rsi.toFixed(1) : "—"}
+                    </td>
+                    <td className={`py-2 pr-4 font-mono ${
+                      s.macd_histogram != null
+                        ? s.macd_histogram >= 0 ? "text-emerald-400" : "text-red-400"
+                        : "text-gray-600"
+                    }`}>
+                      {s.macd_histogram != null
+                        ? `${s.macd_histogram >= 0 ? "+" : ""}${s.macd_histogram.toFixed(6)}`
+                        : "—"}
+                    </td>
+                    <td className={`py-2 pr-4 font-mono ${
+                      s.bb_position != null
+                        ? s.bb_position < 0.3 ? "text-emerald-400" : s.bb_position > 0.7 ? "text-red-400" : "text-gray-300"
+                        : "text-gray-600"
+                    }`}>
+                      {s.bb_position != null ? s.bb_position.toFixed(2) : "—"}
+                    </td>
+                    <td className="py-2 pr-4 font-mono text-gray-400">
+                      {s.ann_volatility != null
+                        ? `${(s.ann_volatility * 100).toFixed(0)}%`
+                        : "—"}
+                    </td>
+                    <td className="py-2 font-mono text-gray-400">
+                      {s.final_size_pct != null
+                        ? `${(s.final_size_pct * 100).toFixed(1)}%`
+                        : "—"}
                     </td>
                   </tr>
                 );
@@ -1691,10 +1801,17 @@ export default function EmaPage() {
       {/* Trade history */}
       {closed.length > 0 && (
         <div>
-          <h2 className="text-lg font-semibold mb-4 text-indigo-300">
-            Closed Trades ({closed.length})
-          </h2>
-          <div className="overflow-x-auto">
+          <button
+            type="button"
+            onClick={() => setClosedExpanded((v) => !v)}
+            className="flex items-center gap-3 mb-4 w-full text-left hover:opacity-80 transition-opacity"
+          >
+            <span className="text-gray-500 text-sm w-3 inline-block">{closedExpanded ? "▾" : "▸"}</span>
+            <h2 className="text-lg font-semibold text-indigo-300">
+              Closed Trades ({closed.length})
+            </h2>
+          </button>
+          <div className="overflow-x-auto" hidden={!closedExpanded}>
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-gray-400 text-left border-b border-gray-800">
@@ -1763,7 +1880,23 @@ export default function EmaPage() {
                         )}
                       </td>
                       <td className={`py-2 text-xs ${reasonColor}`}>
-                        {p.exit_reason ?? "—"}
+                        <span className="flex items-center gap-1.5">
+                          {p.exit_reason ?? "—"}
+                          {p.exit_verified === true && (
+                            <span className="text-emerald-400" title="Exit verified on-chain">v</span>
+                          )}
+                          {p.exit_verified === false && (
+                            <span className="text-red-400 font-bold" title="Exit verification failed — stuck">!</span>
+                          )}
+                          {p.status === "STUCK" && (
+                            <span className="bg-red-900/50 text-red-300 text-[10px] px-1 py-0.5 rounded font-bold">STUCK</span>
+                          )}
+                          {(p.tao_recovered ?? 0) > 0 && (
+                            <span className="text-amber-400 text-[10px]" title={`${p.tao_recovered!.toFixed(4)} τ recovered via retry`}>
+                              +{p.tao_recovered!.toFixed(3)}τ
+                            </span>
+                          )}
+                        </span>
                       </td>
                     </tr>
                   );

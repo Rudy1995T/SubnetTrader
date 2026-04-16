@@ -402,11 +402,15 @@ class Widget:
         self._draw_spark(s)
 
     def _mbox_wrap(self, func, *args, **kwargs):
-        """Show a messagebox without it hiding behind the topmost widget."""
+        """Show a messagebox without it freezing the overrideredirect widget."""
+        # Temporarily become a normal WM-managed window so the modal dialog
+        # can receive focus and input on Linux / X11.
+        self.root.overrideredirect(False)
         self.root.attributes("-topmost", False)
         try:
             return func(*args, parent=self.root, **kwargs)
         finally:
+            self.root.overrideredirect(True)
             if self._topmost:
                 self.root.attributes("-topmost", True)
 
@@ -517,8 +521,8 @@ class Widget:
                         va="center", fontsize=9, transform=ax.transAxes)
                 if ep > 0:
                     c = GREEN if cur >= ep else RED
-                    ax.axhline(y=0.35, color=c, linestyle=":", linewidth=0.8,
-                               alpha=0.7, transform=ax.transAxes)
+                    ax.plot([0, 1], [0.35, 0.35], color=c, linestyle=":",
+                            linewidth=0.8, alpha=0.7, transform=ax.transAxes)
                 ax.set_title(f"{name}  {cur:.6f}", fontsize=9, color=WHITE, loc="left", pad=4)
                 ax.set_xticks([]); ax.set_yticks([])
                 for sp in ax.spines.values():
@@ -635,7 +639,7 @@ class Widget:
         pnl = tk.Label(f, text="", fg=GREY, bg=BG_CARD, font=self._ft, anchor="center", width=7)
         pnl.pack(side=tk.LEFT)
 
-        tao = tk.Label(f, text="", fg=GREY, bg=BG_CARD, font=self._ft, anchor="center", width=8)
+        tao = tk.Label(f, text="", fg=GREY, bg=BG_CARD, font=self._ft, anchor="center", width=12)
         tao.pack(side=tk.LEFT)
 
         date_lbl = tk.Label(f, text="", fg=GREY, bg=BG_CARD, font=self._ft, anchor="center", width=10)
@@ -797,11 +801,16 @@ class Widget:
         def _usd(tao: float) -> str:
             return f" (${tao * usd:,.0f})" if usd else ""
 
-        # Wallet balance from combined
+        # Wallet balance from combined (free TAO + alpha marked-to-market)
         if p:
             wb = (p.get("combined") or {}).get("wallet_balance")
             if wb is not None:
-                self._lbl_wallet.configure(text=f"Wallet  {wb:.2f} \u03c4{_usd(wb)}")
+                alpha_val = sum(
+                    pos.get("amount_alpha", 0) * pos.get("current_price", 0)
+                    for pos in _strat_positions(p)
+                )
+                total = wb + alpha_val
+                self._lbl_wallet.configure(text=f"Wallet  {total:.2f} \u03c4{_usd(total)}")
             else:
                 self._lbl_wallet.configure(text="Wallet  \u2014")
         else:
@@ -958,7 +967,11 @@ class Widget:
                 row["stag"].configure(text=stag_text, fg=stag_colour)
                 row["subnet"].configure(text=label)
                 row["pnl"].configure(text=f"{sign}{pnl_pct:.1f}%", fg=fg)
-                row["tao"].configure(text=f"{pnl_tao:+.2f}\u03c4", fg=fg)
+                tao_str = f"{pnl_tao:+.2f}\u03c4"
+                if usd:
+                    pnl_usd = abs(pnl_tao * usd)
+                    tao_str += f"/${pnl_usd:,.0f}" if pnl_usd >= 1 else f"/${pnl_usd:.2f}"
+                row["tao"].configure(text=tao_str, fg=fg)
                 row["reason"].configure(text=reason_short, fg=GREY)
                 row["date"].configure(text=dt_str, fg=GREY)
 
@@ -993,7 +1006,8 @@ class Widget:
             wins = sum(1 for t in daily if (t.get("pnl_tao") or 0) > 0)
             wr = int(wins / count * 100) if count else 0
             fg_pnl = GREEN if total_pnl >= 0 else RED
-            txt = f"Today: {count} trade{'s' if count != 1 else ''}  {total_pnl:+.2f}\u03c4  {wr}% win"
+            usd_part = f"/${abs(total_pnl * usd):,.0f}" if usd else ""
+            txt = f"Today: {count} trade{'s' if count != 1 else ''}  {total_pnl:+.2f}\u03c4{usd_part}  {wr}% win"
             self._lbl_daily.configure(text=txt, fg=fg_pnl)
         else:
             self._lbl_daily.configure(text="Today: no trades", fg=GREY)

@@ -25,6 +25,7 @@ from app.notifications.telegram import (
     send_alert,
 )
 from app.portfolio.ema_manager import EmaManager
+from app.portfolio.pot_sizer import compute_pots
 from app.storage.db import Database
 from app.utils.time import utc_iso
 
@@ -42,7 +43,59 @@ _scalper_exit_watch_status: dict[str, object | None] = {
 _trend_exit_watch_status: dict[str, object | None] = {
     "last_run": None, "last_error": None, "last_exit_count": 0,
 }
+_scalper_entry_watch_status: dict[str, object | None] = {
+    "last_run": None, "last_error": None, "last_crossover_count": 0,
+}
+_trend_entry_watch_status: dict[str, object | None] = {
+    "last_run": None, "last_error": None, "last_crossover_count": 0,
+}
 _ema_cycle_running: bool = False
+
+
+async def _get_open_netuids(mgr: EmaManager) -> set[int]:
+    """Return netuids currently held by a strategy manager."""
+    return {p.netuid for p in await mgr._open_positions_snapshot()}
+_last_wallet_balance_tao: float | None = None
+
+
+async def _apply_pot_sizing() -> tuple[float, float, float | None]:
+    """Refresh wallet balance and mutate each manager's ``pot_tao`` per
+    ``EMA_POT_MODE``. Returns ``(pot_a, pot_b, wallet_balance)``.
+
+    On wallet read failure in ``wallet_split`` mode, falls back to the
+    previous cycle's pot rather than zeroing mid-trade.
+    """
+    global _last_wallet_balance_tao
+    wallet_balance: float | None = None
+    if executor is not None:
+        try:
+            raw = float(await executor.get_tao_balance())
+            # get_tao_balance returns 0.0 when both SDK and Subtensor
+            # fallback fail (instead of raising).  Treat zero as a failed
+            # read so we don't poison pot_tao and false-trip the breaker.
+            if raw > 0:
+                wallet_balance = raw
+                _last_wallet_balance_tao = wallet_balance
+            else:
+                logger.warning("Wallet balance returned 0 — treating as failed read")
+                wallet_balance = _last_wallet_balance_tao
+        except Exception as exc:
+            logger.warning(f"Wallet balance read failed: {exc}")
+            wallet_balance = _last_wallet_balance_tao
+
+    pot_a, pot_b = compute_pots(wallet_balance, settings)
+
+    # Sentinel: wallet_split with no balance available — keep existing pots.
+    if pot_a < 0 and pot_b < 0:
+        pot_a = ema_scalper._cfg.pot_tao if ema_scalper else 0.0
+        pot_b = ema_trend._cfg.pot_tao if ema_trend else 0.0
+
+    if ema_scalper is not None:
+        ema_scalper._cfg.pot_tao = pot_a
+    if ema_trend is not None:
+        ema_trend._cfg.pot_tao = pot_b
+
+    return pot_a, pot_b, wallet_balance
 _tao_usd_cache: dict[str, float | None] = {"price": None, "fetched_at": 0.0}
 
 
@@ -50,7 +103,18 @@ async def init_services() -> None:
     """Initialize the EMA runtime and its shared infrastructure."""
     global db, executor, taostats, ema_scalper, ema_trend
 
-    logger.info("Initializing EMA services")
+    active = []
+    if settings.EMA_ENABLED:
+        active.append("A")
+    if settings.EMA_B_ENABLED:
+        active.append("B")
+    logger.info(
+        f"Initializing EMA services — active strategies: {active or ['NONE']}"
+    )
+    if not active:
+        logger.warning("Both EMA_ENABLED and EMA_B_ENABLED are false — no strategies will run")
+
+    prune_old_logs()
 
     db = Database()
     await db.connect()
@@ -73,6 +137,17 @@ async def init_services() -> None:
     if ema_scalper and ema_trend:
         ema_scalper._companion_exit_cb = ema_trend.on_companion_exit
         ema_trend._companion_exit_cb = ema_scalper.on_companion_exit
+        # Wire companion netuid callbacks for entry watcher cross-exclusion
+        ema_scalper._companion_netuids_cb = (
+            lambda: _get_open_netuids(ema_trend)
+        )
+        ema_trend._companion_netuids_cb = (
+            lambda: _get_open_netuids(ema_scalper)
+        )
+
+    # Set root claim type to "Keep" so emissions accumulate as alpha
+    if not settings.EMA_DRY_RUN:
+        await executor.ensure_root_claim_keep()
 
     logger.info(
         "EMA services initialized",
@@ -118,6 +193,7 @@ async def run_ema_cycle() -> None:
     _ema_cycle_running = True
     try:
         logger.info(f"Starting EMA dual cycle at {utc_iso()}")
+        await _apply_pot_sizing()
         # Collect occupied netuids from both strategies for cross-exclusion
         scalper_netuids: set[int] = set()
         trend_netuids: set[int] = set()
@@ -198,6 +274,118 @@ async def run_trend_exit_watch() -> None:
         logger.error(f"Trend exit watcher failed: {exc}", data={"error": str(exc)})
 
 
+async def run_scalper_entry_watch() -> None:
+    """Lightweight entry crossover poll for the Scalper strategy."""
+    global _scalper_entry_watch_status
+    if ema_scalper is None or not settings.EMA_ENTRY_WATCHER_ENABLED:
+        return
+    if os.path.exists(settings.KILL_SWITCH_PATH):
+        return
+    if _ema_cycle_running:
+        return
+    try:
+        summary = await ema_scalper.run_entry_watch()
+        _scalper_entry_watch_status = {
+            "last_run": utc_iso(), "last_error": None,
+            "last_crossover_count": len(summary.get("new_crossovers", [])),
+        }
+        if summary.get("new_crossovers"):
+            logger.info("Scalper entry watcher: crossovers triggered cycle", data=summary)
+    except Exception as exc:
+        _scalper_entry_watch_status = {
+            "last_run": utc_iso(), "last_error": str(exc), "last_crossover_count": 0,
+        }
+        logger.error(f"Scalper entry watcher failed: {exc}", data={"error": str(exc)})
+
+
+async def run_trend_entry_watch() -> None:
+    """Lightweight entry crossover poll for the Trend strategy."""
+    global _trend_entry_watch_status
+    if ema_trend is None or not settings.EMA_ENTRY_WATCHER_ENABLED:
+        return
+    if os.path.exists(settings.KILL_SWITCH_PATH):
+        return
+    if _ema_cycle_running:
+        return
+    try:
+        summary = await ema_trend.run_entry_watch()
+        _trend_entry_watch_status = {
+            "last_run": utc_iso(), "last_error": None,
+            "last_crossover_count": len(summary.get("new_crossovers", [])),
+        }
+        if summary.get("new_crossovers"):
+            logger.info("Trend entry watcher: crossovers triggered cycle", data=summary)
+    except Exception as exc:
+        _trend_entry_watch_status = {
+            "last_run": utc_iso(), "last_error": str(exc), "last_crossover_count": 0,
+        }
+        logger.error(f"Trend entry watcher failed: {exc}", data={"error": str(exc)})
+
+
+async def run_root_claim() -> None:
+    """Claim accumulated root emissions for all netuids with open positions."""
+    if executor is None:
+        return
+    if settings.EMA_DRY_RUN and settings.EMA_B_DRY_RUN:
+        return
+
+    netuids: set[int] = set()
+    if ema_scalper:
+        netuids |= {p.netuid for p in await ema_scalper._open_positions_snapshot()}
+    if ema_trend:
+        netuids |= {p.netuid for p in await ema_trend._open_positions_snapshot()}
+
+    if not netuids:
+        logger.debug("Root claim: no open positions, skipping")
+        return
+
+    sorted_netuids = sorted(netuids)
+    logger.info(f"Claiming root emissions for netuids {sorted_netuids}")
+    ok = await executor.claim_root_emissions(sorted_netuids)
+    if ok:
+        logger.info(f"Root emissions claimed successfully for {sorted_netuids}")
+    else:
+        logger.warning(f"Root emission claim had failures for {sorted_netuids}")
+
+
+def prune_old_logs() -> None:
+    """Delete JSONL files in ``settings.JSONL_DIR`` older than
+    ``LOG_RETENTION_DAYS``. Matches both ``YYYY-MM-DD.jsonl`` and rotated
+    ``YYYY-MM-DD.jsonl.N`` files. Best-effort: errors are logged, never raised.
+    """
+    import re
+    from datetime import datetime, timedelta, timezone
+
+    directory = settings.JSONL_DIR
+    days = max(0, int(settings.LOG_RETENTION_DAYS))
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days)
+    pattern = re.compile(r"^(\d{4}-\d{2}-\d{2})\.jsonl(?:\.\d+)?$")
+    removed = 0
+    try:
+        entries = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in entries:
+        m = pattern.match(name)
+        if not m:
+            continue
+        try:
+            file_date = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            try:
+                os.remove(os.path.join(directory, name))
+                removed += 1
+            except OSError as exc:
+                logger.warning(f"Failed to prune log {name}: {exc}")
+    if removed:
+        logger.info(
+            f"Pruned {removed} old log file(s) older than {days}d",
+            data={"removed": removed, "retention_days": days},
+        )
+
+
 def setup_scheduler() -> AsyncIOScheduler:
     """Configure the EMA scheduler."""
     sched = AsyncIOScheduler()
@@ -230,6 +418,47 @@ def setup_scheduler() -> AsyncIOScheduler:
             name="Trend Exit Watcher",
             max_instances=1,
             misfire_grace_time=max(settings.EMA_EXIT_WATCHER_SEC, 5),
+        )
+    if settings.EMA_ENABLED and settings.EMA_ENTRY_WATCHER_ENABLED:
+        sched.add_job(
+            run_scalper_entry_watch,
+            trigger="interval",
+            seconds=settings.EMA_ENTRY_WATCHER_SEC,
+            id="scalper_entry_watch",
+            name="Scalper Entry Watcher",
+            max_instances=1,
+            misfire_grace_time=max(settings.EMA_ENTRY_WATCHER_SEC, 5),
+        )
+    if settings.EMA_B_ENABLED and settings.EMA_ENTRY_WATCHER_ENABLED:
+        sched.add_job(
+            run_trend_entry_watch,
+            trigger="interval",
+            seconds=settings.EMA_ENTRY_WATCHER_SEC,
+            id="trend_entry_watch",
+            name="Trend Entry Watcher",
+            max_instances=1,
+            misfire_grace_time=max(settings.EMA_ENTRY_WATCHER_SEC, 5),
+        )
+    # Prune old JSONL logs daily (and once at startup, see init_services)
+    sched.add_job(
+        prune_old_logs,
+        trigger="interval",
+        hours=24,
+        id="log_retention",
+        name="Log Retention",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    # Claim root emissions every 6 hours for open positions
+    if not (settings.EMA_DRY_RUN and settings.EMA_B_DRY_RUN):
+        sched.add_job(
+            run_root_claim,
+            trigger="interval",
+            hours=6,
+            id="root_claim",
+            name="Root Emission Claimer",
+            max_instances=1,
+            misfire_grace_time=300,
         )
     return sched
 
@@ -443,7 +672,7 @@ def create_health_app():
         import time as time_module
 
         import httpx
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Request
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import JSONResponse
         from starlette.responses import Response
@@ -581,7 +810,11 @@ def create_health_app():
             try:
                 if executor:
                     balance = await executor.get_tao_balance()
-                    pot = settings.EMA_POT_TAO + (settings.EMA_B_POT_TAO if settings.EMA_B_ENABLED else 0)
+                    pot_a_live, pot_b_live = compute_pots(balance, settings)
+                    if pot_a_live < 0:
+                        pot_a_live = ema_scalper._cfg.pot_tao if ema_scalper else 0.0
+                        pot_b_live = ema_trend._cfg.pot_tao if ema_trend else 0.0
+                    pot = pot_a_live + pot_b_live
                     kill_switch = os.path.exists(settings.KILL_SWITCH_PATH)
                     scalper_breaker = ema_scalper.is_breaker_active if ema_scalper else False
                     trend_breaker = ema_trend.is_breaker_active if ema_trend else False
@@ -682,6 +915,11 @@ def create_health_app():
         async def api_ema_portfolio():
             alpha_prices = await taostats.get_alpha_prices() if taostats else {}
             snapshot = taostats._pool_snapshot if taostats else {}
+            # Refresh pot sizing so summary reflects current mode/wallet state.
+            try:
+                await _apply_pot_sizing()
+            except Exception as exc:
+                logger.debug(f"Pot sizing refresh skipped: {exc}")
             result: dict = {}
 
             for key, mgr, exit_status in [
@@ -720,6 +958,9 @@ def create_health_app():
                 "total_deployed": (s.get("deployed_tao") or 0) + (t.get("deployed_tao") or 0),
                 "total_open": (s.get("open_count") or 0) + (t.get("open_count") or 0),
                 "wallet_balance": wallet_balance,
+                "pot_mode": settings.EMA_POT_MODE,
+                "fee_reserve_tao": settings.EMA_FEE_RESERVE_TAO,
+                "pot_weight": settings.EMA_POT_WEIGHT,
             }
 
             return JSONResponse(content=result)
@@ -756,15 +997,26 @@ def create_health_app():
 
             from app.strategy.ema_signals import (
                 bars_above_below_ema,
+                build_sampled_candles,
                 compute_ema,
+                compute_mtf_signal,
                 dual_ema_signal,
             )
+            from app.strategy.indicators import (
+                compute_bollinger_bands,
+                compute_macd,
+                compute_rsi,
+            )
+            from app.utils.math import rolling_volatility
 
             # Use scalper params as the primary signal display (fastest EMA)
             primary = ema_scalper or ema_trend
             fast_p = primary._cfg.fast_period if primary else 3
             slow_p = primary._cfg.slow_period if primary else 9
             confirm = primary._cfg.confirm_bars if primary else 3
+            mtf_enabled = primary._cfg.mtf_enabled if primary else False
+            mtf_lower_tf = primary._cfg.mtf_lower_tf_hours if primary else 1
+            mtf_confirm = primary._cfg.mtf_confirm_bars if primary else 3
 
             # Collect open position netuids so they are always included
             open_netuids: set[int] = set()
@@ -805,6 +1057,59 @@ def create_health_app():
                         prices, ema_trend._cfg.fast_period,
                         ema_trend._cfg.slow_period, ema_trend._cfg.confirm_bars,
                     )
+                # Multi-timeframe confirmation
+                if mtf_enabled:
+                    lower_candles = build_sampled_candles(seven_day, timeframe_hours=mtf_lower_tf)
+                    mtf = compute_mtf_signal(lower_candles, fast_p, slow_p, mtf_confirm)
+                    sig_data["mtf_lower_tf_hours"] = mtf_lower_tf
+                    sig_data["lower_tf_ema_fast"] = mtf["lower_tf_ema_fast"]
+                    sig_data["lower_tf_ema_slow"] = mtf["lower_tf_ema_slow"]
+                    sig_data["lower_tf_bars_above"] = mtf["lower_tf_bars_above"]
+                    sig_data["mtf_confirmed"] = mtf["lower_tf_bullish"]
+                    # Per-strategy MTF if both active
+                    if ema_scalper and ema_trend:
+                        for mgr, key in [(ema_scalper, "mtf_scalper"), (ema_trend, "mtf_trend")]:
+                            if mgr._cfg.mtf_enabled:
+                                lc = build_sampled_candles(seven_day, timeframe_hours=mgr._cfg.mtf_lower_tf_hours)
+                                m = compute_mtf_signal(lc, mgr._cfg.fast_period, mgr._cfg.slow_period, mgr._cfg.mtf_confirm_bars)
+                                sig_data[key] = m["lower_tf_bullish"]
+                # Volatility-based sizing info
+                vol_cfg = primary._cfg if primary else None
+                if vol_cfg and vol_cfg.vol_sizing_enabled:
+                    vol = rolling_volatility(prices, window=vol_cfg.vol_window)
+                    sig_data["ann_volatility"] = round(vol, 4) if vol is not None else None
+                    if vol is not None:
+                        vol_clamped = max(vol_cfg.vol_floor, min(vol, vol_cfg.vol_cap))
+                        vol_pct = vol_cfg.vol_target_risk / vol_clamped
+                        vol_pct = max(vol_cfg.vol_min_size_pct, min(vol_pct, vol_cfg.vol_max_size_pct))
+                        sig_data["vol_adjusted_size_pct"] = round(vol_pct, 4)
+                        # Pool-depth size for comparison
+                        tao_in_pool = float(snap_data.get("total_tao", 0) or 0) / 1e9
+                        if tao_in_pool > 0:
+                            depth_pct = round((tao_in_pool * 0.025) / vol_cfg.pot_tao, 4)
+                        else:
+                            depth_pct = round(vol_cfg.position_size_pct, 4)
+                        sig_data["pool_depth_size_pct"] = depth_pct
+                        sig_data["final_size_pct"] = round(min(vol_pct, depth_pct), 4)
+                    else:
+                        sig_data["vol_adjusted_size_pct"] = None
+                        sig_data["pool_depth_size_pct"] = None
+                        sig_data["final_size_pct"] = None
+                # Technical indicators (RSI, MACD, Bollinger Bands)
+                if len(prices) >= 2:
+                    rsi = compute_rsi(prices)
+                    sig_data["rsi"] = round(rsi[-1], 1)
+                    _, _, histogram = compute_macd(prices)
+                    sig_data["macd_histogram"] = round(histogram[-1], 6)
+                    bb_upper, bb_middle, bb_lower = compute_bollinger_bands(prices)
+                    bb_range = bb_upper[-1] - bb_lower[-1]
+                    sig_data["bb_position"] = round(
+                        (prices[-1] - bb_lower[-1]) / bb_range if bb_range > 0 else 0.5, 2
+                    )
+                else:
+                    sig_data["rsi"] = None
+                    sig_data["macd_histogram"] = None
+                    sig_data["bb_position"] = None
                 return sig_data
 
             results = []
@@ -841,6 +1146,8 @@ def create_health_app():
                     "ema_period": slow_p,
                     "fast_ema_period": fast_p,
                     "strategies": strategies,
+                    "mtf_enabled": mtf_enabled,
+                    "mtf_lower_tf_hours": mtf_lower_tf,
                 }
             )
 
@@ -865,6 +1172,15 @@ def create_health_app():
             except RuntimeError as e:
                 raise HTTPException(status_code=409, detail=str(e))
             return JSONResponse(content={"success": True, "result": result})
+
+        @app.get("/api/ema/stuck-positions")
+        async def api_ema_stuck_positions():
+            stuck: list[dict] = []
+            for mgr in [ema_scalper, ema_trend]:
+                if mgr is not None:
+                    for info in mgr._stuck_positions.values():
+                        stuck.append({**info, "strategy": mgr._cfg.tag})
+            return JSONResponse(content={"stuck": stuck, "count": len(stuck)})
 
         @app.get("/api/ema/slippage-stats")
         async def api_ema_slippage_stats():
@@ -1028,6 +1344,67 @@ def create_health_app():
                 content=buffer.getvalue(),
                 media_type="text/csv",
                 headers={"Content-Disposition": "attachment; filename=ema_trades.csv"},
+            )
+
+        # ── SSE live price feed ─────────────────────────────────────
+        import json as _json
+
+        _sse_connections = 0
+
+        @app.get("/api/prices")
+        async def price_stream(request: Request):
+            nonlocal _sse_connections
+
+            if _sse_connections >= settings.PRICE_FEED_MAX_CONNECTIONS:
+                return JSONResponse(
+                    {"error": "too many price stream connections"}, status_code=503
+                )
+
+            async def event_generator():
+                nonlocal _sse_connections
+                _sse_connections += 1
+                try:
+                    while True:
+                        if await request.is_disconnected():
+                            break
+                        snapshot = taostats._pool_snapshot if taostats else {}
+                        payload = {
+                            int(netuid): {
+                                "price": float(snap.get("price", 0) or 0),
+                                "tao_in_pool": float(snap.get("total_tao", 0) or 0) / 1e9,
+                                "alpha_in_pool": float(snap.get("alpha_in_pool", 0) or 0) / 1e9,
+                            }
+                            for netuid, snap in snapshot.items()
+                        }
+                        data = _json.dumps({"ts": utc_iso(), "prices": payload})
+                        yield f"data: {data}\n\n"
+
+                        # Wait for snapshot refresh or timeout
+                        if taostats:
+                            try:
+                                await asyncio.wait_for(
+                                    taostats._price_updated.wait(),
+                                    timeout=settings.PRICE_FEED_INTERVAL_SEC,
+                                )
+                                taostats._price_updated.clear()
+                            except asyncio.TimeoutError:
+                                pass
+                        else:
+                            await asyncio.sleep(settings.PRICE_FEED_INTERVAL_SEC)
+                finally:
+                    _sse_connections -= 1
+
+            from starlette.responses import StreamingResponse
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
             )
 
         return app

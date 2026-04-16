@@ -42,6 +42,9 @@ FIELD_TYPES: dict[str, str] = {
     "EMA_DRY_RUN": "bool",
     "EMA_STRATEGY_TAG": "str",
     "EMA_POT_TAO": "float_pos",
+    "EMA_POT_MODE": "pot_mode",
+    "EMA_FEE_RESERVE_TAO": "float_range",
+    "EMA_POT_WEIGHT": "float_range",
     "EMA_MAX_POSITIONS": "int_range",
     "EMA_POSITION_SIZE_PCT": "float_range",
     "MAX_SLIPPAGE_PCT": "float_range",
@@ -111,6 +114,8 @@ FIELD_CONSTRAINTS: dict[str, dict[str, Any]] = {
     "EMA_B_DRAWDOWN_PAUSE_HOURS": {"min": 0.5, "max": 48.0},
     "EMA_B_BREAKEVEN_TRIGGER_PCT": {"min": 1.0, "max": 50.0},
     "SCAN_INTERVAL_MIN": {"min": 1, "max": 60},
+    "EMA_FEE_RESERVE_TAO": {"min": 0.0, "max": 1000.0},
+    "EMA_POT_WEIGHT": {"min": 0.0, "max": 1.0},
 }
 
 # Fields that trigger full_restart_required
@@ -128,6 +133,9 @@ ENV_TEMPLATE_ORDER = [
             "EMA_DRY_RUN",
             "EMA_STRATEGY_TAG",
             "EMA_POT_TAO",
+            "EMA_POT_MODE",
+            "EMA_FEE_RESERVE_TAO",
+            "EMA_POT_WEIGHT",
             "EMA_MAX_POSITIONS",
             "EMA_POSITION_SIZE_PCT",
             "EMA_STOP_LOSS_PCT",
@@ -324,6 +332,11 @@ def _validate_field(field: str, value: Any, all_values: dict[str, Any]) -> str |
         allowed = FIELD_CONSTRAINTS.get(field, {}).get("values", [])
         if v not in allowed:
             return f"Must be one of: {', '.join(str(x) for x in allowed)}"
+        return None
+
+    if ft == "pot_mode":
+        if str(value) not in ("fixed", "wallet_split"):
+            return "Must be 'fixed' or 'wallet_split'"
         return None
 
     if ft == "log_level":

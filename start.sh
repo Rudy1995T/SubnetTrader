@@ -30,17 +30,24 @@ for i in $(seq 1 15); do
   fi
 done
 
-echo "[4/5] Cleaning stale frontend cache..."
+echo "[4/5] Ensuring frontend production build..."
 fuser -k 3000/tcp 2>/dev/null || true; sleep 1
-rm -rf frontend/.next
-echo "  ✓ .next cache cleared"
-
-echo "[5/5] Starting frontend..."
 cd frontend
-nohup npm run dev >> /tmp/frontend.log 2>&1 &
+if [ ! -d ".next" ] || [ -n "$REBUILD_FRONTEND" ]; then
+  echo "  • Building frontend (npm run build)..."
+  npm run build >> /tmp/frontend-build.log 2>&1
+  echo "  ✓ Build complete (log: /tmp/frontend-build.log)"
+else
+  echo "  ✓ .next/ exists — skipping build (set REBUILD_FRONTEND=1 to force)"
+fi
+cd "$SCRIPT_DIR"
+
+echo "[5/5] Starting frontend (production)..."
+cd frontend
+nohup npm run start -- -p 3000 >> /tmp/frontend.log 2>&1 &
 FRONTEND_PID=$!
 cd "$SCRIPT_DIR"
-echo "  ✓ Frontend started (PID $FRONTEND_PID) — first page load will take ~10s to compile"
+echo "  ✓ Frontend started (PID $FRONTEND_PID) — production server, no HMR"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
