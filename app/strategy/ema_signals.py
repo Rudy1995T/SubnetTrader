@@ -247,6 +247,38 @@ def compute_mtf_signal(
     }
 
 
+def detect_history_resolution_hours(history: list[dict]) -> float | None:
+    """Estimate the native sample interval of a history payload, in hours.
+
+    Uses the median of consecutive timestamp deltas (robust to occasional
+    gaps). Returns None if fewer than 2 parseable timestamps are present.
+    """
+    timestamps: list[datetime] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        raw_ts = entry.get("timestamp") or entry.get("t")
+        if raw_ts in (None, ""):
+            continue
+        try:
+            timestamps.append(_parse_point_ts(str(raw_ts)))
+        except Exception:
+            continue
+    if len(timestamps) < 2:
+        return None
+    timestamps.sort()
+    deltas = [
+        (cur - prev).total_seconds()
+        for prev, cur in zip(timestamps, timestamps[1:])
+        if (cur - prev).total_seconds() > 0
+    ]
+    if not deltas:
+        return None
+    deltas.sort()
+    median = deltas[len(deltas) // 2]
+    return median / 3600.0
+
+
 def build_candles_from_history(
     history: list[dict],
     candle_hours: int = 4,
@@ -258,7 +290,8 @@ def build_candles_from_history(
     produces higher-quality candles.
 
     Gaps (missing intervals) are skipped — no forward-fill.
-    A warning is logged if >10% of expected candles are missing.
+    A warning is logged only when the requested candle size is finer than the
+    native sample resolution (i.e. real gaps, not downsampling).
     """
     parsed: list[tuple[datetime, float]] = []
     for entry in history:
@@ -288,18 +321,22 @@ def build_candles_from_history(
         bucket_start = (epoch // candle_sec) * candle_sec
         buckets.setdefault(bucket_start, []).append((ts, price))
 
-    # Check for missing candles
+    # Check for missing candles — only warn when we asked for a denser
+    # timeframe than the data's native resolution (real gaps, not downsampling).
     if len(buckets) >= 2:
-        sorted_keys = sorted(buckets)
-        expected = (sorted_keys[-1] - sorted_keys[0]) // candle_sec + 1
-        if expected > 0:
-            missing_pct = (expected - len(buckets)) / expected * 100
-            if missing_pct > 10:
-                from app.logging.logger import logger
-                logger.warning(
-                    f"History candles: {missing_pct:.0f}% missing "
-                    f"({len(buckets)}/{expected} present, {candle_hours}h tf)"
-                )
+        native_tf = detect_history_resolution_hours(history) or float(candle_hours)
+        if candle_hours <= native_tf:
+            sorted_keys = sorted(buckets)
+            expected = (sorted_keys[-1] - sorted_keys[0]) // candle_sec + 1
+            if expected > 0:
+                missing_pct = (expected - len(buckets)) / expected * 100
+                if missing_pct > 10:
+                    from app.logging.logger import logger
+                    logger.warning(
+                        f"History candles: {missing_pct:.0f}% missing "
+                        f"({len(buckets)}/{expected} present, {candle_hours}h tf, "
+                        f"native ~{native_tf:.1f}h)"
+                    )
 
     candles: list[Candle] = []
     prior_close: float | None = None

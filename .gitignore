@@ -14,6 +14,7 @@ env/
 
 # Data (keep structure, ignore contents)
 data/ledger.db
+data/subnet_trader.db
 data/bot.log
 data/logs/
 data/exports/

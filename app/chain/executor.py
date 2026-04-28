@@ -51,6 +51,13 @@ def rao_to_tao(rao: int) -> float:
     return rao / RAO_PER_TAO
 
 
+def _executor_is_dry() -> bool:
+    """True when no strategy intends to trade live — skip wallet/substrate init."""
+    return not settings.MR_ENABLED and (
+        not settings.EMA_B_ENABLED or settings.EMA_B_DRY_RUN
+    )
+
+
 class SwapExecutor:
     """
     Handles quoting and executing swaps between TAO (netuid=0) and
@@ -68,7 +75,7 @@ class SwapExecutor:
         """
         Initialize the Bittensor wallet and substrate connection.
         """
-        if settings.EMA_DRY_RUN:
+        if _executor_is_dry():
             logger.info(
                 "SwapExecutor initialized (DRY_RUN - wallet and substrate skipped)",
                 data={"wallet": settings.BT_WALLET_NAME, "hotkey": settings.BT_WALLET_HOTKEY},
@@ -368,7 +375,7 @@ class SwapExecutor:
         """
         if max_slippage_pct is None:
             max_slippage_pct = settings.MAX_SLIPPAGE_PCT
-        effective_dry_run = settings.EMA_DRY_RUN if dry_run is None else dry_run
+        effective_dry_run = _executor_is_dry() if dry_run is None else dry_run
 
         timestamp = utc_iso()
         amount_rao = tao_to_rao(amount_tao)
@@ -766,9 +773,9 @@ class SwapExecutor:
             except Exception as e:
                 logger.warning(f"Failed to get balance via SDK (shared conn): {e}")
 
-        # In dry-run mode, return the configured simulated balance for position sizing.
-        if settings.EMA_DRY_RUN:
-            return settings.EMA_DRY_RUN_STARTING_TAO
+        # In dry-run mode, return a simulated balance sized for both strategies' pots.
+        if _executor_is_dry():
+            return settings.MR_POT_TAO + settings.EMA_B_POT_TAO
 
         # Last resort: fresh Subtensor connection (avoids WebSocket contention)
         if self._wallet is not None:

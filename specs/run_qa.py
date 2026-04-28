@@ -231,7 +231,7 @@ print("── TC-2  Open Positions: Widget vs Database ──")
 
 db_open_by_strat = {}
 for row in db_open:
-    db_open_by_strat.setdefault(row.get("strategy", "scalper"), []).append(row)
+    db_open_by_strat.setdefault(row.get("strategy", "meanrev"), []).append(row)
 
 # TC-2.1
 if strats_list:
@@ -798,9 +798,9 @@ except Exception as e:
     skip("TC-8.1", "Kill switch pause/resume", f"error: {e}")
 
 skip("TC-8.2", "Kill switch: resume allows new entries",
-     "[RISKY] run-ema-cycle could enter real positions with 1 open slot on scalper")
+     "[RISKY] run-ema-cycle could enter real positions with 1 open slot on meanrev")
 skip("TC-8.3", "Manual close removes position", "[MUTATING] would close a real live position")
-skip("TC-8.4", "Reset dry-run clears history", "[RISKY] bot is live (EMA_DRY_RUN=false)")
+skip("TC-8.4", "Reset dry-run clears history", "[RISKY] bot is live (meanrev always live)")
 print()
 
 # ===========================================================================
@@ -983,6 +983,104 @@ if db_all:
            not bad, f"violators: {bad[:3]}")
 else:
     skip("TC-13.3", "safe_staking guard", "no positions in DB")
+print()
+
+# ===========================================================================
+# TC-14  Pool Flow Momentum Strategy
+# ===========================================================================
+print("── TC-14  Pool Flow Momentum Strategy ──")
+
+flow_enabled = ENV.get("FLOW_ENABLED", "false").lower() == "true"
+flow_portfolio_r = client.get(f"{BASE}/api/flow/portfolio")
+flow_positions_r = client.get(f"{BASE}/api/flow/positions?limit=200")
+flow_signals_r   = client.get(f"{BASE}/api/flow/signals")
+
+flow_portfolio = ok_json(flow_portfolio_r)
+flow_positions = parse_list(flow_positions_r, "positions", "data") or []
+flow_sig_resp  = ok_json(flow_signals_r)
+flow_sig_list  = (flow_sig_resp or {}).get("signals", []) if flow_sig_resp else []
+
+if not flow_enabled:
+    skip("TC-14.1", "Flow endpoints reachable", "FLOW_ENABLED=false in .env")
+    skip("TC-14.2", "Snapshot persistence active (pool_snapshots table non-empty)",
+         "FLOW_ENABLED=false in .env")
+    skip("TC-14.3", "Snapshots pruned under retention window",
+         "FLOW_ENABLED=false in .env")
+    skip("TC-14.4", "Flow signal values are BUY / HOLD / BLOCKED-*",
+         "FLOW_ENABLED=false in .env")
+    skip("TC-14.5", "Cross-strategy exclusion: flow ∩ (trend ∪ meanrev) = ∅",
+         "FLOW_ENABLED=false in .env")
+    skip("TC-14.6", "BUY signals have z_score >= z_entry",
+         "FLOW_ENABLED=false in .env")
+else:
+    # TC-14.1  Endpoints reachable and enabled
+    all_ok = (
+        flow_portfolio_r.status_code == 200
+        and flow_portfolio is not None
+        and flow_portfolio.get("enabled") is True
+    )
+    report("TC-14.1", "Flow endpoints reachable and strategy enabled",
+           all_ok,
+           f"portfolio:{flow_portfolio_r.status_code} positions:{flow_positions_r.status_code} "
+           f"signals:{flow_signals_r.status_code}")
+
+    # TC-14.2  pool_snapshots table populated
+    try:
+        snap_count = db_query("SELECT COUNT(*) as n FROM pool_snapshots")[0]["n"]
+        report("TC-14.2", "pool_snapshots table populated (persistence hook wired)",
+               snap_count > 0, f"rows={snap_count}")
+    except Exception as e:
+        skip("TC-14.2", "pool_snapshots populated", f"query failed: {e}")
+
+    # TC-14.3  All snapshots within retention window
+    retention_h = int(ENV.get("FLOW_SNAPSHOT_RETENTION_HOURS", "336"))
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(hours=retention_h + 2)).isoformat()
+    try:
+        stale = db_query(
+            "SELECT COUNT(*) as n FROM pool_snapshots WHERE ts < ?", (cutoff,)
+        )[0]["n"]
+        report("TC-14.3", f"No pool_snapshots older than retention + 2h ({retention_h}h)",
+               stale == 0, f"stale rows={stale}")
+    except Exception as e:
+        skip("TC-14.3", "Snapshot retention", f"query failed: {e}")
+
+    # TC-14.4  Signal values from allowed set
+    if flow_sig_list:
+        allowed_prefixes = ("BUY", "HOLD", "BLOCKED-")
+        bad = [s for s in flow_sig_list
+               if not any(str(s.get("signal", "")).startswith(p) for p in allowed_prefixes)]
+        report("TC-14.4", "Flow signal values are BUY / HOLD / BLOCKED-*",
+               not bad, f"bad: {[s.get('signal') for s in bad[:3]]}")
+    else:
+        skip("TC-14.4", "Flow signal values", "signals endpoint empty")
+
+    # TC-14.5  Cross-strategy exclusion: flow subnets not held by trend/meanrev
+    flow_open_netuids = {
+        int(p["netuid"]) for p in flow_positions if p.get("status") == "OPEN"
+    }
+    other_open_netuids = {
+        row["netuid"] for row in db_open
+        if row.get("strategy") in (ENV.get("EMA_STRATEGY_TAG", "meanrev"),
+                                   ENV.get("EMA_B_STRATEGY_TAG", "trend"))
+    }
+    overlap = flow_open_netuids & other_open_netuids
+    report("TC-14.5", "Cross-strategy exclusion: flow ∩ (trend ∪ meanrev) = ∅",
+           not overlap, f"overlap netuids: {overlap}")
+
+    # TC-14.6  BUY signals satisfy z_entry threshold
+    if flow_sig_list:
+        z_entry = float(flow_sig_resp.get("z_entry", ENV.get("FLOW_Z_ENTRY", 2.0)))
+        buys = [s for s in flow_sig_list if s.get("signal") == "BUY"]
+        if buys:
+            bad = [s for s in buys
+                   if s.get("z_score") is None or float(s["z_score"]) < z_entry]
+            report("TC-14.6", f"BUY signals have z_score >= z_entry ({z_entry})",
+                   not bad, f"violators: {[(s.get('netuid'), s.get('z_score')) for s in bad[:3]]}")
+        else:
+            skip("TC-14.6", "BUY z_score threshold", "no BUY signals currently")
+    else:
+        skip("TC-14.6", "BUY z_score threshold", "signals endpoint empty")
 print()
 
 # ===========================================================================

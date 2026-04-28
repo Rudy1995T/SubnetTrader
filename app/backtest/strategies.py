@@ -19,6 +19,8 @@ class BacktestStrategyConfig:
     slow_period: int
     confirm_bars: int
     candle_timeframe_hours: int = 4
+    # Strategy dispatch: "ema" (default, dual-EMA) or "meanrev" (mean-reversion)
+    strategy_type: str = "ema"
     # Risk management
     stop_loss_pct: float = 8.0
     take_profit_pct: float = 20.0
@@ -53,6 +55,11 @@ class BacktestStrategyConfig:
     reject_structural_decline_pct: float = 10.0
     min_pool_depth_tao: float = 3000.0
     parabolic_guard_mult: float = 1.5
+    # Mean-reversion specific (used when strategy_type == "meanrev")
+    rsi_entry: float = 30.0
+    rsi_exit: float = 65.0
+    bb_std: float = 2.0
+    bb_mid_exit: bool = True
 
 
 # ── A: Current Production Configs ─────────────────────────────────────
@@ -156,6 +163,47 @@ E4 = BacktestStrategyConfig(
     strategy_id="E4", tag="confirm_5", fast_period=3, slow_period=9, confirm_bars=5
 )
 
+# ── F: Mean-Reversion ─────────────────────────────────────────────────
+
+F1 = BacktestStrategyConfig(
+    strategy_id="F1", tag="meanrev", strategy_type="meanrev",
+    fast_period=3, slow_period=9, confirm_bars=2,
+    candle_timeframe_hours=1,
+    stop_loss_pct=5.0, take_profit_pct=8.0,
+    max_holding_hours=24, cooldown_hours=2.0,
+    pot_tao=5.0, position_size_pct=0.25, max_positions=4,
+    rsi_entry=30.0, rsi_exit=65.0, rsi_period=14,
+    bb_period=20, bb_std=2.0, bb_mid_exit=True,
+    min_pool_depth_tao=3000.0,
+    # Disable EMA-specific filters for mean-reversion
+    bounce_enabled=False, mtf_enabled=False,
+    momentum_filters_enabled=False,
+    rsi_filter_enabled=False, macd_filter_enabled=False, bb_filter_enabled=False,
+    parabolic_guard_mult=99.0,
+)
+
+def _meanrev_variant(**overrides) -> BacktestStrategyConfig:
+    base = F1.__dict__.copy()
+    base.update(overrides)
+    return BacktestStrategyConfig(**base)
+
+
+F2 = _meanrev_variant(strategy_id="F2", tag="meanrev_loose", rsi_entry=35.0, bb_std=2.0)
+F3 = _meanrev_variant(strategy_id="F3", tag="meanrev_tight", rsi_entry=25.0, bb_std=2.5)
+F4 = _meanrev_variant(strategy_id="F4", tag="meanrev_4h", candle_timeframe_hours=4)
+F5 = _meanrev_variant(
+    strategy_id="F5", tag="meanrev_longhold",
+    max_holding_hours=72, take_profit_pct=12.0,
+)
+F6 = _meanrev_variant(strategy_id="F6", tag="meanrev_tight_stop", stop_loss_pct=3.0)
+F7 = _meanrev_variant(
+    strategy_id="F7", tag="meanrev_wide_stop",
+    stop_loss_pct=8.0, take_profit_pct=12.0,
+)
+F8 = _meanrev_variant(strategy_id="F8", tag="meanrev_no_bbmid", bb_mid_exit=False)
+
+MEAN_REVERSION = [F1, F2, F3, F4, F5, F6, F7, F8]
+
 # ── Strategy Groups ───────────────────────────────────────────────────
 
 PRODUCTION = [A1, A2]
@@ -164,7 +212,14 @@ ALT_TIMEFRAME = [C1, C2, C3, C4]
 FILTER_ABLATION = [D1, D2, D3, D4, D5, D6, D7, D8]
 CONFIRM_SENSITIVITY = [E1, E2, E3, E4]
 
-ALL_STRATEGIES = PRODUCTION + ALT_EMA + ALT_TIMEFRAME + FILTER_ABLATION + CONFIRM_SENSITIVITY
+ALL_STRATEGIES = (
+    PRODUCTION
+    + ALT_EMA
+    + ALT_TIMEFRAME
+    + FILTER_ABLATION
+    + CONFIRM_SENSITIVITY
+    + MEAN_REVERSION
+)
 
 STRATEGY_MAP = {s.strategy_id: s for s in ALL_STRATEGIES}
 

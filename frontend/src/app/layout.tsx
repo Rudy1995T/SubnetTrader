@@ -3,8 +3,8 @@ import "./globals.css";
 import ConditionalNav from "@/components/ConditionalNav";
 
 export const metadata: Metadata = {
-  title: "SubnetTrader EMA Live",
-  description: "EMA live trading control surface",
+  title: "SubnetTrader Live",
+  description: "Multi-strategy trading control surface",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

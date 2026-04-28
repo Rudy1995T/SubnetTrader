@@ -92,6 +92,32 @@ hasn't reversed in a day, the thesis is broken.
 - Source: `build_sampled_candles()` or `build_candles_from_history()` with
   `candle_hours=1`, using seven_day_prices from the pool snapshot.
 
+### Historical data acquisition
+
+Mean-reversion requires sufficient historical price data for RSI(14) and
+Bollinger Bands(20) to produce meaningful signals. On startup and each cycle,
+the manager fetches history via the Taostats API:
+
+1. **Primary source:** `TaostatsClient.get_subnet_history(netuid, interval="1h",
+   limit=168)` — fetches up to 7 days of hourly candle data from
+   `/api/dtao/pool/history/v1`. This gives ~168 data points per subnet, well
+   above the minimum 20 needed for BB and 14 for RSI.
+
+2. **Fallback:** If the history endpoint fails or returns insufficient data,
+   fall back to `get_price_history(netuid)` which extracts `seven_day_prices`
+   from the cached pool snapshot (no extra API call). Build 1h candles from
+   the raw price array via `build_sampled_candles(prices, candle_hours=1)`.
+
+3. **Minimum data guard:** Skip any subnet where fewer than `MR_BB_PERIOD + 1`
+   (21) hourly candles are available — indicators would be unreliable. Log a
+   warning and move on.
+
+4. **Rate-limit awareness:** The API tier allows 60 req/min. With ~40 candidate
+   subnets and a 5-min cycle, fetching history for each is ~40 calls/cycle.
+   Use the existing `_pool_snapshot` cache where possible and only call the
+   history endpoint for subnets that pass the initial pool-depth and Gini
+   filters (typically 10–20 subnets).
+
 ## Implementation plan
 
 ### Phase 1: Config and signal layer
@@ -103,7 +129,6 @@ hasn't reversed in a day, the thesis is broken.
 
    ```
    MR_ENABLED: bool = True
-   MR_DRY_RUN: bool = True
    MR_STRATEGY_TAG: str = "meanrev"
    MR_POT_TAO: float = 5.0
    MR_POSITION_SIZE_PCT: float = 0.25
@@ -134,9 +159,10 @@ hasn't reversed in a day, the thesis is broken.
    ```
 
    Replace `strategy_a_config()` with `meanrev_config()` → returns
-   `StrategyConfig` with new fields. Add `StrategyConfig.strategy_type: str`
-   field (`"ema"` or `"meanrev"`) so the manager knows which entry/exit logic
-   to run.
+   `StrategyConfig` with new fields (no dry_run — strategy goes live
+   immediately, validated by backtest against API-fetched history). Add
+   `StrategyConfig.strategy_type: str` field (`"ema"` or `"meanrev"`) so the
+   manager knows which entry/exit logic to run.
 
 2. **`app/strategy/mean_reversion.py`** (new file) — Pure signal functions:
 
@@ -197,8 +223,8 @@ hasn't reversed in a day, the thesis is broken.
    the same. Update strategy tag references in logging/API from `"scalper"` to
    `"meanrev"`.
 
-5. **`.env` / `.env.example`** — Add `MR_*` variables, remove `EMA_*` Scalper
-   variables. Keep all `EMA_B_*` (Trend) variables unchanged.
+5. **`.env` / `.env.example`** — Add `MR_*` variables (no `MR_DRY_RUN`), remove
+   `EMA_*` Scalper variables. Keep all `EMA_B_*` (Trend) variables unchanged.
 
 ### Phase 4: Cleanup
 
@@ -218,13 +244,14 @@ hasn't reversed in a day, the thesis is broken.
 ### Phase 5: Backtest validation
 
 9. **`app/backtest/strategies.py`** — Add a `MeanReversionStrategy` backtest class
-   that mirrors the live signal logic. Run against the existing 200-point history
-   cache for subnets #5–#45. Compare Sharpe ratio, win rate, and max drawdown
-   against the historical Scalper results.
+   that mirrors the live signal logic. Fetch historical data via
+   `TaostatsClient.get_subnet_history(netuid, interval="1h", limit=168)` for
+   subnets #5–#45. Compare Sharpe ratio, win rate, and max drawdown against
+   the historical Scalper results. The backtest must pass the success criteria
+   before the strategy is deployed live.
 
 ## Risk mitigation
 
-- **Launch in DRY_RUN** (`MR_DRY_RUN=true`) and monitor for 48h before going live.
 - **Cross-exclusion** prevents both strategies piling into the same subnet.
 - **Circuit breaker** (drawdown 15% in 24h) pauses entries — inherited from
   EmaManager.
@@ -242,9 +269,13 @@ hasn't reversed in a day, the thesis is broken.
 
 ## Success criteria
 
-- Mean-reversion in DRY_RUN for 1 week shows:
+- Backtest on historical data (fetched via `get_subnet_history`) shows:
   - Win rate > 50% (target: 55–65%)
   - Average holding time < 12h
   - More trades than Trend (targeting the frequent 5–10% swings)
   - Positive PnL after simulated slippage
-- Backtest on historical data shows positive expectancy across #5–#45 subnets
+  - Positive expectancy across #5–#45 subnets
+- Live monitoring after deployment:
+  - First 48h: verify signal generation, entry/exit triggers, and API data
+    quality via structured logs and `/api/ema/portfolio` endpoint
+  - First week: compare live trade metrics against backtest expectations

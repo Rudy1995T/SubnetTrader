@@ -44,7 +44,9 @@ FIELD_TYPES: dict[str, str] = {
     "EMA_POT_TAO": "float_pos",
     "EMA_POT_MODE": "pot_mode",
     "EMA_FEE_RESERVE_TAO": "float_range",
-    "EMA_POT_WEIGHT": "float_range",
+    "EMA_MEANREV_WEIGHT": "float_range",
+    "EMA_TREND_WEIGHT": "float_range",
+    "EMA_FLOW_WEIGHT": "float_range",
     "EMA_MAX_POSITIONS": "int_range",
     "EMA_POSITION_SIZE_PCT": "float_range",
     "MAX_SLIPPAGE_PCT": "float_range",
@@ -115,7 +117,9 @@ FIELD_CONSTRAINTS: dict[str, dict[str, Any]] = {
     "EMA_B_BREAKEVEN_TRIGGER_PCT": {"min": 1.0, "max": 50.0},
     "SCAN_INTERVAL_MIN": {"min": 1, "max": 60},
     "EMA_FEE_RESERVE_TAO": {"min": 0.0, "max": 1000.0},
-    "EMA_POT_WEIGHT": {"min": 0.0, "max": 1.0},
+    "EMA_MEANREV_WEIGHT": {"min": 0.0, "max": 1.0},
+    "EMA_TREND_WEIGHT": {"min": 0.0, "max": 1.0},
+    "EMA_FLOW_WEIGHT": {"min": 0.0, "max": 1.0},
 }
 
 # Fields that trigger full_restart_required
@@ -135,7 +139,9 @@ ENV_TEMPLATE_ORDER = [
             "EMA_POT_TAO",
             "EMA_POT_MODE",
             "EMA_FEE_RESERVE_TAO",
-            "EMA_POT_WEIGHT",
+            "EMA_MEANREV_WEIGHT",
+            "EMA_TREND_WEIGHT",
+            "EMA_FLOW_WEIGHT",
             "EMA_MAX_POSITIONS",
             "EMA_POSITION_SIZE_PCT",
             "EMA_STOP_LOSS_PCT",

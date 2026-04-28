@@ -24,12 +24,39 @@ from app.strategy.ema_signals import (
     candle_close_prices,
     compute_ema,
     compute_mtf_signal,
+    detect_history_resolution_hours,
     dual_ema_signal,
     ema_signal,
 )
 from app.strategy.indicators import compute_atr, compute_bollinger_bands, compute_macd, compute_rsi
+from app.strategy.mean_reversion import (
+    detect_new_meanrev_signal,
+    meanrev_entry_signal,
+    meanrev_exit_signal,
+)
+from app.strategy.flow_signals import (
+    FlowSignalConfig,
+    compute_ring_flow_delta,
+    flow_entry_signal,
+    flow_exit_signal,
+    has_gap,
+    regime_index,
+)
 from app.utils.math import compute_price_changes, gini_coefficient, pearson_r, rolling_volatility
 from app.utils.time import utc_now, utc_iso, parse_iso
+
+
+def _regime_gate_key(strategy_type: str) -> str:
+    """Map ``StrategyConfig.strategy_type`` to the env-configured gate name."""
+    st = (strategy_type or "").strip().lower()
+    if st == "meanrev":
+        return "mr"
+    if st == "flow":
+        return "flow"
+    if st == "yield":
+        return "yield"
+    # Default bucket covers "ema" (Trend) and anything unrecognized
+    return "ema"
 
 
 @dataclass
@@ -86,6 +113,9 @@ class EmaManager:
         # Companion netuids callback: returns netuids held by companion strategy
         # (used by entry watcher for cross-exclusion)
         self._companion_netuids_cb: typing.Callable[[], typing.Awaitable[set[int]]] | None = None
+        # Volatility regime filter (set by main.py during init). Optional so
+        # unit tests and legacy callers that don't supply one still work.
+        self._regime: typing.Any | None = None
         # Entry watcher: track last-known EMA crossover state per subnet
         self._last_crossover_state: dict[int, str] = {}
         # Serialize full cycles (scheduled + entry-watcher-triggered)
@@ -134,7 +164,10 @@ class EmaManager:
             )
         except Exception:
             self._realized_pnl = 0.0
-        # Warm up deep history for open positions on startup
+        # Warm up deep history for open positions on startup. Note: the Taostats
+        # endpoint currently returns ~daily samples regardless of the requested
+        # interval, so this is only useful as an HTF-resolution background
+        # series (trend guards), NOT as dense live-TF data.
         if self._open and settings.SUBNET_HISTORY_ENABLED and settings.SUBNET_HISTORY_ON_STARTUP:
             for pos in self._open:
                 try:
@@ -291,6 +324,24 @@ class EmaManager:
             logger.info(f"EMA[{self._cfg.tag}] cycle complete", data=summary)
             return summary
 
+        # Volatility regime gate — block entries in unfavorable regimes.
+        # Classification runs in all modes; gating only when REGIME_ENABLED.
+        if self._regime is not None:
+            try:
+                await self._regime.refresh()
+            except Exception as exc:
+                logger.debug(f"Regime refresh skipped: {exc}")
+            strategy_key = _regime_gate_key(self._cfg.strategy_type)
+            if not self._regime.entry_allowed(strategy_key):
+                summary["regime_blocked"] = self._regime.current_regime
+                summary["entries_skipped"] = f"regime={self._regime.current_regime}"
+                logger.info(
+                    f"EMA[{self._cfg.tag}]: skipping entries — "
+                    f"regime={self._regime.current_regime}"
+                )
+                logger.info(f"EMA[{self._cfg.tag}] cycle complete", data=summary)
+                return summary
+
         occupied = {p.netuid for p in open_positions}
         if globally_occupied:
             occupied |= globally_occupied
@@ -356,18 +407,45 @@ class EmaManager:
                     f"pool depth {tao_in_pool:.0f} TAO < min {self._cfg.min_pool_depth_tao:.0f}"
                 )
                 continue
-            candles = _get_completed_candles(
-                netuid,
-                snapshot,
-                cur,
-                timeframe_hours=self._cfg.candle_timeframe_hours,
-            )
-            prices = candle_close_prices(candles)
-            if len(prices) < self._cfg.confirm_bars:
-                continue
-            # Dual EMA confirmation: both fast and slow must agree
-            if dual_ema_signal(prices, self._cfg.fast_period, self._cfg.slow_period, self._cfg.confirm_bars) != "BUY":
-                continue
+            # Build prices at the strategy's candle timeframe. For mean-reversion
+            # (1h) the seven_day_prices stream is usually too coarse, so fetch
+            # the history endpoint first and cache it in _warm_history.
+            if self._cfg.strategy_type == "meanrev":
+                prices = await self._get_meanrev_prices(netuid, snapshot, cur)
+                candles = []  # unused for meanrev
+            else:
+                candles = _get_completed_candles(
+                    netuid,
+                    snapshot,
+                    cur,
+                    timeframe_hours=self._cfg.candle_timeframe_hours,
+                )
+                prices = candle_close_prices(candles)
+            if self._cfg.strategy_type == "meanrev":
+                if len(prices) < self._cfg.bb_period + 1:
+                    logger.debug(
+                        f"MR[{self._cfg.tag}]: SN{netuid} skipped — "
+                        f"only {len(prices)} prices (< {self._cfg.bb_period + 1})"
+                    )
+                    continue
+                if not meanrev_entry_signal(
+                    prices,
+                    rsi_threshold=self._cfg.rsi_oversold,
+                    rsi_period=self._cfg.rsi_period,
+                    bb_period=self._cfg.bb_period,
+                    bb_std=self._cfg.bb_std,
+                ):
+                    continue
+            elif self._cfg.strategy_type == "flow":
+                eval_result = await self._evaluate_flow_entry(netuid, prices)
+                if eval_result is None or eval_result.signal != "BUY":
+                    continue
+            else:
+                if len(prices) < self._cfg.confirm_bars:
+                    continue
+                # Dual EMA confirmation: both fast and slow must agree
+                if dual_ema_signal(prices, self._cfg.fast_period, self._cfg.slow_period, self._cfg.confirm_bars) != "BUY":
+                    continue
             # Multi-timeframe confirmation: lower TF must also be bullish
             if self._cfg.mtf_enabled:
                 lower_candles = _get_completed_candles(
@@ -705,27 +783,138 @@ class EmaManager:
     def _compute_flow_delta(self, netuid: int) -> float | None:
         """Compute TAO flow as percentage of pool depth between current and previous snapshot.
 
-        Returns positive for inflow, negative for outflow, None if data unavailable.
+        Delegates to ``flow_signals.compute_ring_flow_delta`` so the same math
+        is shared with the Pool Flow Momentum strategy.
         """
         cur_snap = self._taostats._pool_snapshot.get(netuid, {})
         prev_snap = self._taostats._prev_pool_snapshot.get(netuid, {})
+        return compute_ring_flow_delta(cur_snap, prev_snap)
 
-        cur_tao = float(cur_snap.get("total_tao", 0) or 0) / 1e9
-        prev_tao = float(prev_snap.get("total_tao", 0) or 0) / 1e9
+    # ── Pool Flow Momentum helpers ────────────────────────────────
 
-        if prev_tao <= 0 or cur_tao <= 0:
+    def _flow_signal_cfg(self) -> FlowSignalConfig:
+        """Return the strategy-level flow signal config derived from settings."""
+        return FlowSignalConfig(
+            z_entry=settings.FLOW_Z_ENTRY,
+            z_exit=settings.FLOW_Z_EXIT,
+            min_tao_pct=settings.FLOW_MIN_TAO_PCT,
+            exit_pct=settings.FLOW_EXIT_PCT,
+            magnitude_cap=settings.FLOW_MAGNITUDE_CAP,
+            window_1h_snaps=settings.FLOW_WINDOW_1H_SNAPS,
+            window_4h_snaps=settings.FLOW_WINDOW_4H_SNAPS,
+            baseline_snaps=settings.FLOW_BASELINE_SNAPS,
+            cold_start_snaps=settings.FLOW_COLD_START_SNAPS,
+            emission_adjust=settings.FLOW_EMISSION_ADJUST,
+            sold_fraction=settings.FLOW_EMISSION_SOLD_FRACTION,
+        )
+
+    async def _evaluate_flow_entry(self, netuid: int, prices: list[float]):
+        """Fetch persisted snapshots + regime context and run the flow signal.
+
+        Returns a ``FlowEvaluation`` or None if snapshot data isn't available
+        yet (e.g. Phase 1 coverage still warming up).
+        """
+        cfg = self._flow_signal_cfg()
+        snapshots = await self._db.get_pool_snapshots(netuid=netuid)
+        if not snapshots or len(snapshots) < cfg.cold_start_snaps:
             return None
 
-        flow_pct = (cur_tao - prev_tao) / prev_tao * 100.0
-        return flow_pct
+        if has_gap(
+            snapshots[-cfg.baseline_snaps - cfg.window_4h_snaps - 1:],
+            max_gap_minutes=settings.FLOW_MAX_GAP_MIN,
+            scan_interval_min=settings.SCAN_INTERVAL_MIN,
+        ):
+            logger.info(f"FLOW[{self._cfg.tag}]: SN{netuid} — snapshot gap, baseline invalid")
+            return None
+
+        ema_fast = ema_slow = None
+        if prices and len(prices) >= max(self._cfg.fast_period, self._cfg.slow_period):
+            fast_vals = compute_ema(prices, self._cfg.fast_period)
+            slow_vals = compute_ema(prices, self._cfg.slow_period)
+            if fast_vals and slow_vals:
+                ema_fast, ema_slow = fast_vals[-1], slow_vals[-1]
+
+        regime_ok = True
+        if settings.FLOW_REGIME_FILTER_ENABLED:
+            regime_ok = await self._regime_ok()
+
+        return flow_entry_signal(
+            snapshots=snapshots,
+            cfg=cfg,
+            ema_fast_value=ema_fast,
+            ema_slow_value=ema_slow,
+            ema_confirm=settings.FLOW_REQUIRE_EMA_CONFIRM,
+            regime_ok=regime_ok,
+        )
+
+    def _cooldown_hours_for(self, reason: str, pnl_tao: float) -> float:
+        """Return the cooldown hours to apply after an exit.
+
+        Flow uses asymmetric cooldowns: stop-outs cool longer than wins or
+        time-based exits. Other strategies always use ``cooldown_hours``.
+        """
+        if self._cfg.strategy_type != "flow":
+            return self._cfg.cooldown_hours
+        if reason in ("STOP_LOSS", "FLOW_Z_EXIT", "FLOW_REVERSAL", "REGIME_EXIT", "GHOST_CLOSE") and pnl_tao <= 0:
+            return settings.FLOW_COOLDOWN_STOP_HOURS
+        if reason in ("TIME_STOP", "PARTIAL_TIME_EXIT"):
+            return settings.FLOW_COOLDOWN_TIME_HOURS
+        return settings.FLOW_COOLDOWN_WIN_HOURS
+
+    def _max_pool_impact_pct(self) -> float:
+        """Return the max single-entry price impact as a fraction (0-1).
+
+        Flow uses ``FLOW_MAX_POOL_IMPACT_PCT`` (default 1.5%) for tighter
+        slippage control than the EMA strategies' default 2.5%.
+        """
+        if self._cfg.strategy_type == "flow":
+            return settings.FLOW_MAX_POOL_IMPACT_PCT / 100.0
+        return 0.025
+
+    async def _regime_ok(self) -> bool:
+        """Return True if the DTAO market-wide index is above the threshold."""
+        lookback = settings.FLOW_REGIME_LOOKBACK_SNAPS
+        # Only consider top-50 subnets by current pool depth — cheap filter first
+        top_netuids = sorted(
+            (
+                (float(snap.get("total_tao", 0) or 0) / 1e9, netuid)
+                for netuid, snap in self._taostats._pool_snapshot.items()
+                if netuid != 0
+            ),
+            reverse=True,
+        )[:50]
+        per_netuid: dict[int, list[dict]] = {}
+        for _, netuid in top_netuids:
+            snaps = await self._db.get_pool_snapshots(netuid=netuid)
+            if snaps and len(snaps) > lookback:
+                per_netuid[netuid] = snaps
+        idx = regime_index(per_netuid, lookback_snaps=lookback)
+        if idx is None:
+            return True  # don't block entries on insufficient regime data
+        ok = idx >= settings.FLOW_REGIME_INDEX_THRESHOLD
+        if not ok:
+            logger.info(
+                f"FLOW[{self._cfg.tag}] regime pause — index {idx:.4f} < "
+                f"{settings.FLOW_REGIME_INDEX_THRESHOLD}"
+            )
+        return ok
 
     def _compute_atr_trail_pct(self, netuid: int, current_price: float) -> float | None:
         """Derive trailing stop % from ATR using cached warm history candles.
 
         Returns None if insufficient data (caller falls back to ROI-based tiers).
+        Warm history is at the endpoint's native resolution (currently daily);
+        if it's coarser than the strategy TF we skip ATR — bucketing coarse
+        samples at a finer TF produces degenerate candles and a meaningless ATR.
         """
         history = self._warm_history.get(netuid)
         if not history:
+            return None
+
+        native_tf = detect_history_resolution_hours(history) or float(
+            self._cfg.candle_timeframe_hours
+        )
+        if native_tf > self._cfg.candle_timeframe_hours:
             return None
 
         candles = build_candles_from_history(
@@ -846,6 +1035,33 @@ class EmaManager:
                 recent = history[-self._cfg.flow_reversal_consecutive:]
                 if all(flow < -self._cfg.flow_reversal_min_outflow_pct for _, flow in recent):
                     return "FLOW_REVERSAL"
+
+        # Flow strategy: consecutive outflow fast path (z-score exit is
+        # evaluated in the scheduled run_cycle via _evaluate_flow_exit).
+        if self._cfg.strategy_type == "flow":
+            history = self._flow_history.get(pos.netuid, [])
+            consecutive = 0
+            for _, flow_pct in reversed(history):
+                if flow_pct < -settings.FLOW_EXIT_PCT:
+                    consecutive += 1
+                else:
+                    break
+            if consecutive >= 2:
+                return "FLOW_REVERSAL"
+            return None
+
+        # Mean-reversion: exit on RSI overbought / BB mid-cross
+        if self._cfg.strategy_type == "meanrev":
+            if meanrev_exit_signal(
+                prices,
+                rsi_overbought=self._cfg.rsi_overbought,
+                rsi_period=self._cfg.rsi_period,
+                bb_period=self._cfg.bb_period,
+                bb_std=self._cfg.bb_std,
+                bb_mid_exit=self._cfg.bb_mid_exit,
+            ):
+                return "MEANREV_EXIT"
+            return None
 
         # EMA cross exit: consecutive closes below EMA
         sig = ema_signal(prices, self._cfg.slow_period, self._cfg.confirm_bars)
@@ -1002,7 +1218,9 @@ class EmaManager:
                 )
                 self._realized_pnl += ghost_pnl
                 self._flow_history.pop(pos.netuid, None)
-                expires = utc_now() + timedelta(hours=self._cfg.cooldown_hours)
+                expires = utc_now() + timedelta(
+                    hours=self._cooldown_hours_for("GHOST_CLOSE", ghost_pnl)
+                )
                 async with self._state_lock:
                     self._open = [p for p in self._open if p.position_id != pos.position_id]
                     self._cooldowns[pos.netuid] = expires
@@ -1121,7 +1339,9 @@ class EmaManager:
             )
             self._realized_pnl += actual_pnl_tao
             self._flow_history.pop(pos.netuid, None)
-            expires = utc_now() + timedelta(hours=self._cfg.cooldown_hours)
+            expires = utc_now() + timedelta(
+                hours=self._cooldown_hours_for(reason, actual_pnl_tao)
+            )
             async with self._state_lock:
                 self._open = [p for p in self._open if p.position_id != pos.position_id]
                 self._cooldowns[pos.netuid] = expires
@@ -1196,9 +1416,9 @@ class EmaManager:
 
         # Adapt position size to pool depth to limit slippage.
         # For constant-product AMM: price_impact ≈ tao_in / tao_reserve.
-        # Target max 2.5% impact (leaves headroom within 5% rate_tolerance).
+        # EMA strategies target 2.5%; flow tightens to FLOW_MAX_POOL_IMPACT_PCT.
         tao_in_pool = float(snap_data.get("total_tao", 0) or 0) / 1e9  # rao → τ
-        max_impact = 0.025  # 2.5%
+        max_impact = self._max_pool_impact_pct()
         if tao_in_pool > 0:
             safe_tao = tao_in_pool * max_impact
             if full_amount > safe_tao:
@@ -1447,7 +1667,9 @@ class EmaManager:
             exit_reason="COMPANION_EXIT",
         )
         self._realized_pnl += pnl_tao
-        expires = utc_now() + timedelta(hours=self._cfg.cooldown_hours)
+        expires = utc_now() + timedelta(
+            hours=self._cooldown_hours_for("COMPANION_EXIT", pnl_tao)
+        )
         async with self._state_lock:
             self._open = [p for p in self._open if p.position_id != pos.position_id]
             self._cooldowns[pos.netuid] = expires
@@ -1466,11 +1688,35 @@ class EmaManager:
 
     # ── Deep history confirmation ─────────────────────────────────
 
-    async def _confirm_with_deep_history(self, netuid: int) -> bool:
-        """Fetch 14-day history and verify the EMA crossover still holds.
+    async def _get_meanrev_prices(
+        self, netuid: int, snapshot: dict, cur: float
+    ) -> list[float]:
+        """Return 1h close prices for mean-reversion signals.
 
-        Returns True if the crossover is confirmed (or history is unavailable
-        — we don't block entries when the endpoint fails).
+        The Taostats subnet-history endpoint currently returns ~daily samples
+        regardless of the requested interval, so we can't use it as a dense
+        1h source — bucketing daily data at 1h produced degenerate candles
+        and polluted the RSI/BB signals. We sample 1h candles from the pool
+        snapshot instead; when that's too sparse to clear bb_period, the
+        candidate is simply skipped (the correct behaviour). The HTF trend
+        guard lives in `_confirm_with_deep_history`, which is called later
+        in the scored-candidate loop.
+        """
+        candles = _get_completed_candles(
+            netuid, snapshot, cur,
+            timeframe_hours=self._cfg.candle_timeframe_hours,
+        )
+        return candle_close_prices(candles)
+
+    async def _confirm_with_deep_history(self, netuid: int) -> bool:
+        """HTF trend guard before entering a fresh position.
+
+        The Taostats subnet-history endpoint currently returns ~daily samples
+        regardless of the requested interval. We treat the payload at its
+        detected native resolution and run an EMA check with HTF-appropriate
+        periods. The gate passes on BUY/HOLD and only blocks on a clear SELL
+        (the HTF is explicitly bearish). Returns True if history is missing
+        or too short — don't block on endpoint hiccups.
         """
         try:
             history = await self._taostats.get_subnet_history(
@@ -1482,43 +1728,79 @@ class EmaManager:
                 logger.debug(f"EMA[{self._cfg.tag}]: SN{netuid} deep history empty, allowing entry")
                 return True
 
-            # Cache the history for the subnet (used in exit checks too)
+            # Cache the history for the subnet (used as HTF-resolution background
+            # series for other guards; NOT a dense live-TF source).
             self._warm_history[netuid] = history
 
-            # Build candles at the strategy's timeframe from deep history
-            deep_candles = build_candles_from_history(
-                history, candle_hours=self._cfg.candle_timeframe_hours
+            if not settings.EMA_HTF_CONFIRM_ENABLED:
+                # Legacy path preserved for one release in case HTF proves too
+                # loose/strict live. It is known-broken when upstream returns
+                # daily data, but retained as an explicit escape hatch.
+                deep_candles = build_candles_from_history(
+                    history, candle_hours=self._cfg.candle_timeframe_hours
+                )
+                if not deep_candles:
+                    return True
+                deep_prices = candle_close_prices(deep_candles)
+                if len(deep_prices) < self._cfg.confirm_bars:
+                    return True
+                legacy = dual_ema_signal(
+                    deep_prices,
+                    self._cfg.fast_period,
+                    self._cfg.slow_period,
+                    self._cfg.confirm_bars,
+                )
+                return legacy == "BUY"
+
+            native_tf = detect_history_resolution_hours(history) or float(
+                self._cfg.candle_timeframe_hours
             )
+            htf_hours = max(int(round(native_tf)), self._cfg.candle_timeframe_hours)
+
+            deep_candles = build_candles_from_history(history, candle_hours=htf_hours)
             if not deep_candles:
-                logger.debug(f"EMA[{self._cfg.tag}]: SN{netuid} no candles from deep history, allowing entry")
+                logger.debug(
+                    f"EMA[{self._cfg.tag}]: SN{netuid} no candles from deep history, allowing entry"
+                )
                 return True
 
             deep_prices = candle_close_prices(deep_candles)
-            if len(deep_prices) < self._cfg.confirm_bars:
+
+            if htf_hours > self._cfg.candle_timeframe_hours:
+                fast, slow, confirm = (
+                    self._cfg.htf_fast_period,
+                    self._cfg.htf_slow_period,
+                    self._cfg.htf_confirm_bars,
+                )
+            else:
+                fast, slow, confirm = (
+                    self._cfg.fast_period,
+                    self._cfg.slow_period,
+                    self._cfg.confirm_bars,
+                )
+
+            if len(deep_prices) < slow + confirm:
                 logger.debug(
-                    f"EMA[{self._cfg.tag}]: SN{netuid} deep history too short "
-                    f"({len(deep_prices)} prices), allowing entry"
+                    f"EMA[{self._cfg.tag}]: SN{netuid} HTF history too short "
+                    f"({len(deep_prices)} prices < {slow + confirm}), allowing entry"
                 )
                 return True
 
-            signal = dual_ema_signal(
-                deep_prices,
-                self._cfg.fast_period,
-                self._cfg.slow_period,
-                self._cfg.confirm_bars,
-            )
-            if signal == "BUY":
+            signal = dual_ema_signal(deep_prices, fast, slow, confirm)
+
+            if signal == "SELL":
                 logger.info(
-                    f"EMA[{self._cfg.tag}]: SN{netuid} deep history confirmed crossover "
-                    f"({len(deep_candles)} candles, {len(history)} data points)"
+                    f"EMA[{self._cfg.tag}]: SN{netuid} HTF trend=SELL — blocking entry "
+                    f"(htf={htf_hours}h, {len(deep_candles)} candles, "
+                    f"fast={fast}, slow={slow})"
                 )
-                return True
+                return False
 
             logger.info(
-                f"EMA[{self._cfg.tag}]: SN{netuid} deep history signal={signal} "
-                f"({len(deep_candles)} candles) — crossover not confirmed"
+                f"EMA[{self._cfg.tag}]: SN{netuid} HTF trend={signal} — entry allowed "
+                f"(htf={htf_hours}h, {len(deep_candles)} candles)"
             )
-            return False
+            return True
 
         except Exception as exc:
             # Don't block entries on history endpoint failures

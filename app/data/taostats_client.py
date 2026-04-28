@@ -273,6 +273,60 @@ class TaostatsClient:
             logger.warning(f"get_fresh_pool SN{netuid} failed: {exc}")
             return None
 
+    # ── Pool reserve helpers (Pool Flow Momentum) ───────────────
+
+    def pool_reserves(self, netuid: int) -> dict | None:
+        """Return a thin slice of the current pool snapshot for a subnet
+        (TAO/alpha reserves, price, block, emission rate). Returns None if no
+        snapshot has been captured yet.
+        """
+        snap = self._pool_snapshot.get(netuid)
+        if not snap:
+            return None
+
+        def _rao(field: str) -> float:
+            try:
+                return float(snap.get(field, 0) or 0) / 1e9
+            except (TypeError, ValueError):
+                return 0.0
+
+        block = snap.get("block_number") or snap.get("block")
+        try:
+            block_int = int(block) if block is not None else None
+        except (TypeError, ValueError):
+            block_int = None
+
+        # Taostats may expose emission_rate at a few paths; try common ones.
+        emission = (
+            snap.get("alpha_emission_rate")
+            or snap.get("emission")
+            or snap.get("emission_rate")
+        )
+        try:
+            emission_f = float(emission) if emission is not None else None
+        except (TypeError, ValueError):
+            emission_f = None
+
+        return {
+            "netuid": int(netuid),
+            "block_number": block_int,
+            "tao_in_pool": _rao("total_tao"),
+            "alpha_in_pool": _rao("alpha_in_pool"),
+            "price": float(snap.get("price", 0) or 0),
+            "alpha_emission_rate": emission_f,
+        }
+
+    def all_pool_reserves(self) -> list[dict]:
+        """Return ``pool_reserves`` for every subnet currently in the
+        cached snapshot. Useful for bulk persistence.
+        """
+        out: list[dict] = []
+        for netuid in self._pool_snapshot:
+            reserves = self.pool_reserves(netuid)
+            if reserves is not None and reserves["tao_in_pool"] > 0:
+                out.append(reserves)
+        return out
+
     # ── Gini support methods ─────────────────────────────────────
 
     def pool_concentration_alert(

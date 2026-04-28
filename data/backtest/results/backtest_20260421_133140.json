@@ -1,0 +1,29 @@
+{
+  "timestamp": "2026-04-21T13:31:40.270687+00:00",
+  "windows": {
+    "30": [
+      {
+        "strategy_id": "F1",
+        "tag": "meanrev",
+        "strategy_type": "meanrev",
+        "window_days": 30,
+        "total_trades": 0,
+        "winning_trades": 0,
+        "losing_trades": 0,
+        "win_rate": 0.0,
+        "avg_win_pct": 0.0,
+        "avg_loss_pct": 0.0,
+        "expectancy": 0.0,
+        "profit_factor": 0.0,
+        "total_pnl_pct": 0.0,
+        "max_drawdown_pct": 0.0,
+        "sharpe_ratio": 0.0,
+        "avg_hold_hours": 0.0,
+        "max_concurrent": 0,
+        "exit_reasons": {},
+        "subnets_traded": [],
+        "trade_count_by_subnet": {}
+      }
+    ]
+  }
+}

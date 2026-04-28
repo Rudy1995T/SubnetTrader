@@ -89,10 +89,10 @@ class Database:
         entry_price: float,
         amount_tao: float,
         amount_alpha: float,
+        strategy: str,
         staked_hotkey: str = "",
         entry_spot_price: float | None = None,
         entry_slippage_pct: float | None = None,
-        strategy: str = "scalper",
     ) -> int:
         cursor = await self.execute(
             """
@@ -297,6 +297,102 @@ class Database:
 
     async def clear_ema_history(self) -> None:
         await self.execute("DELETE FROM ema_positions")
+
+    # ── Pool snapshot helpers (Pool Flow Momentum) ──────────────
+
+    async def save_pool_snapshot(
+        self,
+        netuid: int,
+        ts: str,
+        tao_in_pool: float,
+        alpha_in_pool: float,
+        price: float,
+        block_number: int | None = None,
+        alpha_emission_rate: float | None = None,
+    ) -> None:
+        await self.execute(
+            """
+            INSERT INTO pool_snapshots (
+                netuid, ts, block_number,
+                tao_in_pool, alpha_in_pool, price, alpha_emission_rate
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                netuid,
+                ts,
+                block_number,
+                tao_in_pool,
+                alpha_in_pool,
+                price,
+                alpha_emission_rate,
+            ),
+        )
+
+    async def save_pool_snapshots_bulk(self, rows: list[dict]) -> None:
+        """Insert many snapshots in one transaction. Each row must include the
+        same keys as save_pool_snapshot's parameters (block_number + emission
+        rate may be None)."""
+        if not rows:
+            return
+        payload = [
+            (
+                r["netuid"],
+                r["ts"],
+                r.get("block_number"),
+                r["tao_in_pool"],
+                r["alpha_in_pool"],
+                r["price"],
+                r.get("alpha_emission_rate"),
+            )
+            for r in rows
+        ]
+        await self._conn.executemany(
+            """
+            INSERT INTO pool_snapshots (
+                netuid, ts, block_number,
+                tao_in_pool, alpha_in_pool, price, alpha_emission_rate
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            payload,
+        )
+        await self._conn.commit()
+
+    async def get_pool_snapshots(
+        self,
+        netuid: int,
+        since_ts: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        if since_ts is not None:
+            sql = (
+                "SELECT * FROM pool_snapshots "
+                "WHERE netuid = ? AND ts >= ? ORDER BY ts ASC"
+            )
+            params: tuple = (netuid, since_ts)
+        else:
+            sql = "SELECT * FROM pool_snapshots WHERE netuid = ? ORDER BY ts ASC"
+            params = (netuid,)
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        return await self.fetchall(sql, params)
+
+    async def snapshot_count(self, netuid: int) -> int:
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS n FROM pool_snapshots WHERE netuid = ?",
+            (netuid,),
+        )
+        return int(row["n"]) if row else 0
+
+    async def prune_pool_snapshots(self, older_than_ts: str) -> int:
+        """Delete snapshots with ts < older_than_ts. Returns number of rows removed."""
+        cursor = await self._conn.execute(
+            "DELETE FROM pool_snapshots WHERE ts < ?",
+            (older_than_ts,),
+        )
+        await self._conn.commit()
+        return cursor.rowcount or 0
 
     async def export_ema_positions_csv(self, output_path: str) -> str:
         rows = await self.fetchall("SELECT * FROM ema_positions ORDER BY entry_ts")

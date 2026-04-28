@@ -14,11 +14,10 @@ interface EmaSignal {
   ema: number;
   fast_ema: number;
   signal: "BUY" | "SELL" | "HOLD";
-  signal_scalper?: "BUY" | "SELL" | "HOLD";
+  signal_meanrev?: "BUY" | "SELL" | "HOLD";
   signal_trend?: "BUY" | "SELL" | "HOLD";
   bars: number;
   mtf_confirmed?: boolean;
-  mtf_scalper?: boolean;
   mtf_trend?: boolean;
   mtf_lower_tf_hours?: number;
   lower_tf_ema_fast?: number;
@@ -91,7 +90,7 @@ interface PortfolioData {
 }
 
 interface DualPortfolioData {
-  scalper: PortfolioData;
+  meanrev: PortfolioData;
   trend: PortfolioData;
   combined: {
     total_pot: number;
@@ -100,7 +99,11 @@ interface DualPortfolioData {
     wallet_balance: number | null;
     pot_mode?: "fixed" | "wallet_split";
     fee_reserve_tao?: number;
-    pot_weight?: number;
+    pot_weights?: {
+      meanrev?: number;
+      trend?: number;
+      flow?: number;
+    };
   };
 }
 
@@ -944,13 +947,18 @@ function ToastStack({
 
 function StrategyTag({ tag, dryRun }: { tag: string; dryRun: boolean }) {
   const colors: Record<string, string> = {
-    scalper: "bg-violet-900/60 text-violet-300 border-violet-700",
+    meanrev: "bg-sky-900/60 text-sky-300 border-sky-700",
     trend: "bg-cyan-900/60 text-cyan-300 border-cyan-700",
   };
+  const labels: Record<string, string> = {
+    meanrev: "Mean-Reversion",
+    trend: "Trend",
+  };
   const cls = colors[tag] ?? "bg-gray-800 text-gray-300 border-gray-700";
+  const label = labels[tag] ?? tag.toUpperCase();
   return (
     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-bold border ${cls}`}>
-      {tag.toUpperCase()}
+      {label}
       {dryRun && <span className="text-gray-500 font-normal">PAPER</span>}
     </span>
   );
@@ -967,14 +975,14 @@ function StrategyCard({
   showUsd: boolean;
   taoUsd: number | null;
 }) {
-  const tag = port.tag ?? "scalper";
+  const tag = port.tag ?? "meanrev";
   const fast = port.fast_period ?? 3;
   const slow = port.slow_period ?? 9;
   const realizedPnl = closed.reduce((s, p) => s + (p.pnl_tao ?? 0), 0);
   const wins = closed.filter((p) => (p.pnl_pct ?? 0) > 0).length;
   const unrealizedPnl = (port.open_positions ?? []).reduce((s, p) => s + p.amount_tao * (p.pnl_pct / 100), 0);
   const totalPnl = realizedPnl + unrealizedPnl;
-  const borderColor = tag === "scalper" ? "border-violet-800/50" : "border-cyan-800/50";
+  const borderColor = tag === "meanrev" ? "border-sky-800/50" : "border-cyan-800/50";
 
   return (
     <div className={`bg-gray-900 rounded-lg border ${borderColor} p-4`}>
@@ -1092,11 +1100,11 @@ export default function EmaPage() {
   const taoUsd = taoUsdData?.usd ?? null;
 
   // Derive strategy data from dual response
-  const scalper = dualData?.scalper;
+  const meanrev = dualData?.meanrev;
   const trend = dualData?.trend;
   const combined = dualData?.combined;
   const allOpenPositions = [
-    ...(scalper?.open_positions ?? []).map((p) => ({ ...p, _strategy: "scalper" as const })),
+    ...(meanrev?.open_positions ?? []).map((p) => ({ ...p, _strategy: "meanrev" as const })),
     ...(trend?.open_positions ?? []).map((p) => ({ ...p, _strategy: "trend" as const })),
   ];
 
@@ -1172,7 +1180,7 @@ export default function EmaPage() {
 
     seenClosedIdsRef.current = new Set(closedPositions.map((pos) => pos.id));
     prevOpenMapRef.current = currentOpenMap;
-  }, [scalper?.open_positions, trend?.open_positions, posData]);
+  }, [meanrev?.open_positions, trend?.open_positions, posData]);
 
   async function executeClose(positionId: number) {
     setClosingId(positionId);
@@ -1195,7 +1203,7 @@ export default function EmaPage() {
   }
 
   const closed = (posData?.positions ?? []).filter((p) => p.status === "CLOSED");
-  const scalperClosed = closed.filter((p) => (p as any).strategy === "scalper" || !(p as any).strategy);
+  const meanrevClosed = closed.filter((p) => (p as any).strategy === "meanrev" || (p as any).strategy === "scalper" || !(p as any).strategy);
   const trendClosed = closed.filter((p) => (p as any).strategy === "trend");
   const realizedPnl = closed.reduce((s, p) => s + (p.pnl_tao ?? 0), 0);
   const wins = closed.filter((p) => (p.pnl_pct ?? 0) > 0).length;
@@ -1212,10 +1220,10 @@ export default function EmaPage() {
   const totalPnl = realizedPnl + unrealizedPnl;
 
   // Both strategies disabled
-  if (dualData && !scalper?.enabled && !trend?.enabled) {
+  if (dualData && !meanrev?.enabled && !trend?.enabled) {
     return (
       <div className="text-gray-400 text-sm">
-        EMA strategies are disabled. Set <code>EMA_ENABLED=true</code> or <code>EMA_B_ENABLED=true</code> in .env to enable.
+        EMA strategies are disabled. Set <code>MR_ENABLED=true</code> or <code>EMA_B_ENABLED=true</code> in .env to enable.
       </div>
     );
   }
@@ -1226,8 +1234,8 @@ export default function EmaPage() {
   const holdSignals = signals.length - buySignals - sellSignals;
   const strategies = sigData?.strategies ?? [];
 
-  const anyLive = (scalper && !scalper.dry_run) || (trend && !trend.dry_run);
-  const signalTimeframeHours = scalper?.signal_timeframe_hours ?? trend?.signal_timeframe_hours ?? 4;
+  const anyLive = (meanrev && !meanrev.dry_run) || (trend && !trend.dry_run);
+  const signalTimeframeHours = meanrev?.signal_timeframe_hours ?? trend?.signal_timeframe_hours ?? 4;
   const nextBarClose = getNextBarClose(clockMs, signalTimeframeHours);
   const nextBarCountdown = fmtCountdown(nextBarClose, clockMs);
 
@@ -1242,7 +1250,7 @@ export default function EmaPage() {
 
   // Find the strategy config for a position (by strategy tag)
   function strategyForPos(strategyTag: string): PortfolioData | undefined {
-    return strategyTag === "trend" ? trend ?? undefined : scalper ?? undefined;
+    return strategyTag === "trend" ? trend ?? undefined : meanrev ?? undefined;
   }
 
   return (
@@ -1285,7 +1293,7 @@ export default function EmaPage() {
         )}
       </div>
       <p className="text-xs text-gray-500 mb-6">
-        Two independent EMA strategies — Scalper (fast crosses) and Trend (longer holds) — sharing a single wallet
+        Two independent strategies — Mean-Reversion (RSI/BB) and Trend (EMA crosses) — sharing a single wallet
       </p>
 
       {/* Stuck positions alert */}
@@ -1326,7 +1334,17 @@ export default function EmaPage() {
           value={fmtTao(combined?.total_pot, showUsd, taoUsd)}
           sub={
             combined?.pot_mode === "wallet_split"
-              ? `Auto: ${Math.round((combined.pot_weight ?? 0.5) * 100)}/${Math.round((1 - (combined.pot_weight ?? 0.5)) * 100)} split · ${combined.fee_reserve_tao ?? 1} τ reserve`
+              ? (() => {
+                  const w = combined.pot_weights ?? {};
+                  const parts = [
+                    ["trend", w.trend],
+                    ["meanrev", w.meanrev],
+                    ["flow", w.flow],
+                  ]
+                    .filter(([, v]) => typeof v === "number" && (v as number) > 0)
+                    .map(([k, v]) => `${k} ${Math.round((v as number) * 100)}%`);
+                  return `Auto: ${parts.join(" · ")} · ${combined.fee_reserve_tao ?? 1} τ reserve`;
+                })()
               : "Fixed mode"
           }
         />
@@ -1337,7 +1355,7 @@ export default function EmaPage() {
         />
         <StatCard
           label="Open Positions"
-          value={`${combined?.total_open ?? 0} / ${(scalper?.max_positions ?? 0) + (trend?.max_positions ?? 0)}`}
+          value={`${combined?.total_open ?? 0} / ${(meanrev?.max_positions ?? 0) + (trend?.max_positions ?? 0)}`}
         />
         <StatCard
           label="Total PnL"
@@ -1357,7 +1375,7 @@ export default function EmaPage() {
 
       {/* Per-strategy cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
-        {scalper?.enabled && <StrategyCard port={scalper} closed={scalperClosed} showUsd={showUsd} taoUsd={taoUsd} />}
+        {meanrev?.enabled && <StrategyCard port={meanrev} closed={meanrevClosed} showUsd={showUsd} taoUsd={taoUsd} />}
         {trend?.enabled && <StrategyCard port={trend} closed={trendClosed} showUsd={showUsd} taoUsd={taoUsd} />}
       </div>
 
@@ -1388,7 +1406,7 @@ export default function EmaPage() {
                         <span className="ml-2 text-xs text-gray-500">#{trade.netuid}</span>
                         {strat && (
                           <span className={`ml-2 text-[10px] px-1.5 py-0.5 rounded font-semibold ${
-                            strat === "scalper" ? "bg-violet-900/40 text-violet-300" : "bg-cyan-900/40 text-cyan-300"
+                            strat === "meanrev" ? "bg-sky-900/40 text-sky-300" : "bg-cyan-900/40 text-cyan-300"
                           }`}>{strat}</span>
                         )}
                       </div>
@@ -1468,21 +1486,21 @@ export default function EmaPage() {
               </span>
             )}
           </h2>
-          {(["scalper", "trend"] as const).map((stratKey) => {
+          {(["meanrev", "trend"] as const).map((stratKey) => {
             const stratCards = positionCards.filter((card) => {
               if (card.kind === "exit") return false;
-              return ((card.pos as any)._strategy ?? "scalper") === stratKey;
+              return ((card.pos as any)._strategy ?? "meanrev") === stratKey;
             });
             const stratExits = positionCards.filter((card) => {
               if (card.kind !== "exit") return false;
-              const animStrat = (card.animation.position as any)._strategy ?? "scalper";
+              const animStrat = (card.animation.position as any)._strategy ?? "meanrev";
               return animStrat === stratKey;
             });
             const allCards = [...stratCards, ...stratExits];
             if (allCards.length === 0) return null;
-            const strat = stratKey === "trend" ? trend : scalper;
-            const borderColor = stratKey === "scalper" ? "border-violet-800/50" : "border-cyan-800/50";
-            const headerColor = stratKey === "scalper" ? "text-violet-300" : "text-cyan-300";
+            const strat = stratKey === "trend" ? trend : meanrev;
+            const borderColor = stratKey === "meanrev" ? "border-sky-800/50" : "border-cyan-800/50";
+            const headerColor = stratKey === "meanrev" ? "text-sky-300" : "text-cyan-300";
             const fast = strat?.fast_period ?? 3;
             const slow = strat?.slow_period ?? 9;
             return (
@@ -1507,7 +1525,7 @@ export default function EmaPage() {
                     }
 
                     const pos = card.pos;
-                    const stratTag = (pos as any)._strategy ?? "scalper";
+                    const stratTag = (pos as any)._strategy ?? "meanrev";
                     const posStrat = strategyForPos(stratTag);
                     const livePrice = priceUpdate?.prices[pos.netuid]?.price ?? null;
                     const displayPrice = livePrice ?? pos.current_price;
@@ -1669,7 +1687,7 @@ export default function EmaPage() {
                 <th className="pb-2 pr-4">% vs EMA</th>
                 {strategies.length > 1 ? (
                   <>
-                    <th className="pb-2 pr-4">Scalper</th>
+                    <th className="pb-2 pr-4">Mean-Reversion</th>
                     <th className="pb-2 pr-4">Trend</th>
                   </>
                 ) : (
@@ -1729,7 +1747,7 @@ export default function EmaPage() {
                     {strategies.length > 1 ? (
                       <>
                         <td className="py-2 pr-4">
-                          <SignalBadge signal={s.signal_scalper ?? s.signal} />
+                          <SignalBadge signal={s.signal_meanrev ?? s.signal} />
                         </td>
                         <td className="py-2 pr-4">
                           <SignalBadge signal={s.signal_trend ?? s.signal} />
@@ -1853,7 +1871,7 @@ export default function EmaPage() {
                       <td className="py-2 pr-4">
                         {strat && (
                           <span className={`text-[11px] px-1.5 py-0.5 rounded font-semibold ${
-                            strat === "scalper" ? "bg-violet-900/40 text-violet-300" : "bg-cyan-900/40 text-cyan-300"
+                            strat === "meanrev" ? "bg-sky-900/40 text-sky-300" : "bg-cyan-900/40 text-cyan-300"
                           }`}>{strat}</span>
                         )}
                       </td>

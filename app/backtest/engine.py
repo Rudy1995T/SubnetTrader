@@ -25,6 +25,10 @@ from app.strategy.indicators import (
     compute_macd,
     compute_rsi,
 )
+from app.strategy.mean_reversion import (
+    meanrev_entry_signal,
+    meanrev_exit_signal,
+)
 
 from .slippage import (
     apply_entry_slippage,
@@ -53,6 +57,7 @@ class TradeRecord:
     peak_price: float
     entry_slippage_pct: float = 0.0
     exit_slippage_pct: float = 0.0
+    regime_at_entry: str = "UNKNOWN"
 
 
 @dataclass
@@ -119,13 +124,9 @@ def _check_exit(
     """Check all exit conditions. Returns exit reason or None."""
     pnl_pct = (cur_price - pos.entry_price) / pos.entry_price * 100.0
 
-    # Take-profit
-    if pnl_pct >= cfg.take_profit_pct:
-        return "TAKE_PROFIT"
-
-    # Stop-loss (with RSI suppression if enabled)
+    # Stop-loss and time-stop apply to all strategies
     if pnl_pct <= -cfg.stop_loss_pct:
-        if cfg.rsi_filter_enabled and prices_so_far:
+        if cfg.strategy_type == "ema" and cfg.rsi_filter_enabled and prices_so_far:
             hard_floor = -cfg.stop_loss_pct * 1.5
             if pnl_pct > hard_floor:
                 rsi = compute_rsi(prices_so_far, period=cfg.rsi_period)
@@ -138,25 +139,37 @@ def _check_exit(
         else:
             return "STOP_LOSS"
 
-    # Time stop
     bars_held = bar_index - entry_bar
     hours_held = bars_held * candle_hours
     if hours_held >= cfg.max_holding_hours:
         return "TIME_STOP"
 
-    # Breakeven stop
+    if cfg.strategy_type == "meanrev":
+        return meanrev_exit_signal(
+            prices_so_far,
+            entry_price=pos.entry_price,
+            take_profit_pct=cfg.take_profit_pct,
+            rsi_exit=cfg.rsi_exit,
+            rsi_period=cfg.rsi_period,
+            bb_period=cfg.bb_period,
+            bb_std=cfg.bb_std,
+            bb_mid_exit=cfg.bb_mid_exit,
+        )
+
+    # ── EMA strategy exits ────────────────────────────────────────
+    if pnl_pct >= cfg.take_profit_pct:
+        return "TAKE_PROFIT"
+
     peak_pnl = (pos.peak_price - pos.entry_price) / pos.entry_price * 100.0
     if peak_pnl >= cfg.breakeven_trigger_pct and pnl_pct <= 0:
         return "BREAKEVEN_STOP"
 
-    # Trailing stop
     if pnl_pct > 0 and pos.peak_price > pos.entry_price:
         drawdown = (pos.peak_price - cur_price) / pos.peak_price * 100.0
         trail = _dynamic_trail_pct(pnl_pct, cfg.trailing_stop_pct, cfg.trailing_stop_dynamic)
         if drawdown >= trail:
             return "TRAILING_STOP"
 
-    # EMA cross exit
     if len(prices_so_far) >= cfg.confirm_bars:
         sig = ema_signal(prices_so_far, cfg.slow_period, cfg.confirm_bars)
         if sig == "SELL":
@@ -172,16 +185,25 @@ def _check_entry_filters(
     cfg: BacktestStrategyConfig,
 ) -> bool:
     """Apply entry filters. Returns True if entry is allowed."""
+    # Max entry price filter applies to both strategies
+    if prices and prices[-1] > cfg.max_entry_price_tao:
+        return False
+
+    if cfg.strategy_type == "meanrev":
+        return meanrev_entry_signal(
+            prices,
+            rsi_threshold=cfg.rsi_entry,
+            rsi_period=cfg.rsi_period,
+            bb_period=cfg.bb_period,
+            bb_std=cfg.bb_std,
+        )
+
     if len(prices) < max(cfg.fast_period, cfg.slow_period, cfg.confirm_bars):
         return False
 
     # Dual EMA signal
     sig = dual_ema_signal(prices, cfg.fast_period, cfg.slow_period, cfg.confirm_bars)
     if sig != "BUY":
-        return False
-
-    # Max entry price filter
-    if prices[-1] > cfg.max_entry_price_tao:
         return False
 
     # Parabolic guard: reject if price extended too far above slow EMA
@@ -297,7 +319,11 @@ def backtest_subnet(
         cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
         candles = [c for c in candles if _parse_ts(c.end_ts) >= cutoff]
 
-    if len(candles) < max(cfg.fast_period, cfg.slow_period) + cfg.confirm_bars:
+    if cfg.strategy_type == "meanrev":
+        min_bars = cfg.bb_period + 1
+    else:
+        min_bars = max(cfg.fast_period, cfg.slow_period) + cfg.confirm_bars
+    if len(candles) < min_bars:
         return []
 
     # Build lower-TF candles for MTF (if enabled and different from main TF)
@@ -318,7 +344,8 @@ def backtest_subnet(
     cooldown_until: int = -1  # bar index until which we're in cooldown
     available_tao = cfg.pot_tao
 
-    for i in range(max(cfg.fast_period, cfg.slow_period), len(candles)):
+    start_bar = cfg.bb_period if cfg.strategy_type == "meanrev" else max(cfg.fast_period, cfg.slow_period)
+    for i in range(start_bar, len(candles)):
         cur_price = prices[i]
         prices_so_far = prices[: i + 1]
         candles_so_far = candles[: i + 1]

@@ -2,7 +2,7 @@
 """SubnetTrader Desktop Widget — live dual-strategy portfolio display.
 
 Standalone Tkinter + Matplotlib widget that polls the local FastAPI
-backend and shows both Scalper and Trend strategy positions, sparklines,
+backend and shows both Mean-Reversion and Trend strategy positions, sparklines,
 and signals.  No browser needed.
 
 Usage:
@@ -35,6 +35,12 @@ REFRESH_SEC = int(os.getenv("WIDGET_REFRESH_SEC", "30"))
 OPACITY     = float(os.getenv("WIDGET_OPACITY", "0.92"))
 WIN_W, WIN_H = 480, 760
 
+# Portfolio / signals endpoints hit the Subtensor chain for wallet balance and
+# pool refreshes, which can take 20–30s on a Pi. Keep the light endpoints snappy
+# but give the heavy ones room to finish so positions actually render.
+TIMEOUT_FAST  = 5
+TIMEOUT_HEAVY = 30
+
 # ── Colour palette ─────────────────────────────────────────────────────────
 BG        = "#0d1117"
 BG_CARD   = "#161b22"
@@ -56,6 +62,8 @@ PURPLE    = "#bc8cff"
 class DataStore:
     def __init__(self):
         self.portfolio: dict | None = None
+        self.flow_portfolio: dict | None = None
+        self.flow_signals: dict | None = None
         self.signals: list[dict] = []
         self.strategies: list[dict] = []
         self.trades: list[dict] = []
@@ -74,6 +82,8 @@ class DataStore:
         with self._lock:
             return {
                 "portfolio": self.portfolio,
+                "flow_portfolio": self.flow_portfolio,
+                "flow_signals": self.flow_signals,
                 "signals": self.signals,
                 "strategies": self.strategies,
                 "trades": self.trades,
@@ -90,21 +100,35 @@ def _fetch(store: DataStore):
 
     # Health
     try:
-        r = requests.get(f"{API_BASE}/health", timeout=5)
+        r = requests.get(f"{API_BASE}/health", timeout=TIMEOUT_FAST)
         store.put(bot_online=r.json().get("status") == "ok")
     except Exception:
         store.put(bot_online=False)
 
-    # Portfolio (scalper + trend + combined)
+    # Portfolio (meanrev + trend + combined) — heavy: chain-call for wallet balance
     try:
-        r = requests.get(f"{API_BASE}/api/ema/portfolio", timeout=5)
+        r = requests.get(f"{API_BASE}/api/ema/portfolio", timeout=TIMEOUT_HEAVY)
         store.put(portfolio=r.json())
     except Exception:
         pass
 
-    # Signals (includes prices + EMA arrays for sparklines)
+    # Flow portfolio (separate API surface) — heavy: same chain path
     try:
-        r = requests.get(f"{API_BASE}/api/ema/signals", timeout=5)
+        r = requests.get(f"{API_BASE}/api/flow/portfolio", timeout=TIMEOUT_HEAVY)
+        store.put(flow_portfolio=r.json())
+    except Exception:
+        pass
+
+    # Flow signals (for warmup status)
+    try:
+        r = requests.get(f"{API_BASE}/api/flow/signals", timeout=TIMEOUT_FAST)
+        store.put(flow_signals=r.json())
+    except Exception:
+        pass
+
+    # Signals (includes prices + EMA arrays for sparklines) — heavy: computes indicators per subnet
+    try:
+        r = requests.get(f"{API_BASE}/api/ema/signals", timeout=TIMEOUT_HEAVY)
         data = r.json()
         store.put(signals=data.get("signals", []), strategies=data.get("strategies", []))
     except Exception:
@@ -112,21 +136,21 @@ def _fetch(store: DataStore):
 
     # Recent closed trades
     try:
-        r = requests.get(f"{API_BASE}/api/ema/recent-trades?limit=5", timeout=5)
+        r = requests.get(f"{API_BASE}/api/ema/recent-trades?limit=5", timeout=TIMEOUT_FAST)
         store.put(trades=r.json().get("trades", []))
     except Exception:
         pass
 
     # TAO / USD
     try:
-        r = requests.get(f"{API_BASE}/api/price/tao-usd", timeout=5)
+        r = requests.get(f"{API_BASE}/api/price/tao-usd", timeout=TIMEOUT_FAST)
         store.put(tao_usd=r.json().get("usd"))
     except Exception:
         pass
 
     # Daily trades (larger limit to compute today's stats)
     try:
-        r = requests.get(f"{API_BASE}/api/ema/recent-trades?limit=50", timeout=5)
+        r = requests.get(f"{API_BASE}/api/ema/recent-trades?limit=50", timeout=TIMEOUT_FAST)
         all_trades = r.json().get("trades", [])
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         daily = []
@@ -145,22 +169,60 @@ def _fetch(store: DataStore):
 #  Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-_STRAT_COLOUR = {"scalper": SKY, "trend": PURPLE}
-_STRAT_TAG = {"scalper": "S", "trend": "T"}
+_STRAT_COLOUR = {"meanrev": SKY, "trend": PURPLE, "flow": ORANGE}
+_STRAT_TAG = {"meanrev": "M", "trend": "T", "flow": "F"}
+_STRAT_KEYS = ("meanrev", "trend", "flow")
 
 
-def _strat_positions(portfolio: dict | None) -> list[dict]:
-    """Merge open positions from both strategies, tagged with strategy key."""
-    if portfolio is None:
-        return []
+def _blend(base: str, accent: str, alpha: float) -> str:
+    """Blend hex `accent` into hex `base` by `alpha` (0..1)."""
+    def _h(c): return (int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16))
+    b, a = _h(base), _h(accent)
+    r = int(b[0] + (a[0] - b[0]) * alpha)
+    g = int(b[1] + (a[1] - b[1]) * alpha)
+    bl = int(b[2] + (a[2] - b[2]) * alpha)
+    return f"#{r:02x}{g:02x}{bl:02x}"
+
+
+def _row_bg(strat_key: str, selected: bool = False) -> str:
+    """Tinted row background for the given strategy."""
+    accent = _STRAT_COLOUR.get(strat_key, GREY)
+    if selected:
+        return _blend(BG_HEADER, accent, 0.32)
+    return _blend(BG_CARD, accent, 0.18)
+
+_MISSING_STRAT_WARNED = False
+
+
+def _strat_data(snap: dict, key: str) -> dict:
+    """Return the per-strategy dict regardless of which API it came from."""
+    if key == "flow":
+        return snap.get("flow_portfolio") or {}
+    return (snap.get("portfolio") or {}).get(key, {}) or {}
+
+
+def _strat_positions(portfolio: dict | None, flow_portfolio: dict | None = None) -> list[dict]:
+    """Merge open positions across all enabled strategies, tagged with strategy key."""
+    global _MISSING_STRAT_WARNED
     out: list[dict] = []
-    for key in ("scalper", "trend"):
-        strat = portfolio.get(key, {})
+    for key in _STRAT_KEYS:
+        if key == "flow":
+            strat = flow_portfolio or {}
+        else:
+            strat = (portfolio or {}).get(key, {}) or {}
         if not strat.get("enabled"):
             continue
         for pos in strat.get("open_positions", []):
             pos = dict(pos)  # shallow copy
-            pos["_strategy"] = key
+            if not pos.get("_strategy"):
+                pos["_strategy"] = key
+            elif pos["_strategy"] != key and not _MISSING_STRAT_WARNED:
+                print(
+                    f"[widget] warning: strategy mismatch — position reports "
+                    f"_strategy={pos['_strategy']!r} but came from {key!r} bucket",
+                    flush=True,
+                )
+                _MISSING_STRAT_WARNED = True
             out.append(pos)
     return out
 
@@ -289,7 +351,11 @@ class Widget:
 
         # Per-strategy rows
         self._strat_rows: dict[str, dict] = {}
-        for key, colour, label in [("scalper", SKY, "Scalper"), ("trend", PURPLE, "Trend")]:
+        for key, colour, label in [
+            ("meanrev", SKY, "Mean-Reversion"),
+            ("trend", PURPLE, "Trend"),
+            ("flow", ORANGE, "Flow"),
+        ]:
             row = tk.Frame(f, bg=BG)
             row.pack(fill=tk.X, pady=(3, 0))
             tag_lbl = tk.Label(row, text=f"{label}", fg=colour, bg=BG, font=self._fs, anchor="w", width=8)
@@ -308,6 +374,12 @@ class Widget:
                 "frame": row, "tag": tag_lbl, "ema": ema_lbl, "badge": badge,
                 "pot": pot_lbl, "dep": dep_lbl, "slots": slots_lbl,
             }
+
+        # Extra single-line warmup status under the Flow row
+        self._lbl_flow_warmup = tk.Label(
+            f, text="", fg=ORANGE, bg=BG, font=self._ft, anchor="w",
+        )
+        self._lbl_flow_warmup.pack(fill=tk.X, padx=(60, 0))
 
         tk.Frame(self.root, bg=GREY, height=1).pack(fill=tk.X, padx=8)
 
@@ -328,18 +400,6 @@ class Widget:
 
         self._pos_box = tk.Frame(self.root, bg=BG)
         self._pos_box.pack(fill=tk.X, padx=8)
-
-        # Strategy group headers (packed dynamically in _tick)
-        self._pos_headers: dict[str, dict] = {}
-        for key, colour in [("scalper", SKY), ("trend", PURPLE)]:
-            hf = tk.Frame(self._pos_box, bg=BG)
-            accent = tk.Frame(hf, bg=colour, width=3)
-            accent.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
-            accent.pack_propagate(False)
-            lbl = tk.Label(hf, text=key.upper(), fg=colour, bg=BG,
-                           font=self._fs, anchor="w")
-            lbl.pack(side=tk.LEFT)
-            self._pos_headers[key] = {"frame": hf, "label": lbl, "colour": colour}
 
         self._rows: list[dict] = []
         for i in range(self.MAX_POS_ROWS):
@@ -388,13 +448,16 @@ class Widget:
 
     def _select_pos(self, idx):
         s = self.store.snap()
-        positions = _strat_positions(s["portfolio"])
+        positions = _strat_positions(s["portfolio"], s.get("flow_portfolio"))
         if idx >= len(positions):
             return
         self.selected_netuid = positions[idx]["netuid"]
         # Highlight
         for i, row in enumerate(self._rows):
-            bg = BG_HEADER if i == idx else BG_CARD
+            if i >= len(positions):
+                continue
+            strat_key = positions[i].get("_strategy") or "meanrev"
+            bg = _row_bg(strat_key, selected=(i == idx))
             row["frame"].configure(bg=bg)
             for k in ("stag", "name", "pnl", "pnl_abs", "tao", "close"):
                 row[k].configure(bg=bg)
@@ -416,7 +479,7 @@ class Widget:
 
     def _close_position(self, idx):
         s = self.store.snap()
-        positions = _strat_positions(s["portfolio"])
+        positions = _strat_positions(s["portfolio"], s.get("flow_portfolio"))
         if idx >= len(positions):
             return
         pos = positions[idx]
@@ -425,6 +488,9 @@ class Widget:
         strat = pos.get("_strategy", "?")
         if pid is None:
             return
+
+        close_base = "flow" if strat == "flow" else "ema"
+        close_url = f"{API_BASE}/api/{close_base}/positions/{pid}/close"
 
         import tkinter.messagebox as mbox
         pnl_pct = pos.get("pnl_pct", 0)
@@ -438,7 +504,7 @@ class Widget:
 
         def _do_close():
             try:
-                r = requests.post(f"{API_BASE}/api/ema/positions/{pid}/close", timeout=30)
+                r = requests.post(close_url, timeout=30)
                 result = r.json()
                 if result.get("success"):
                     self.root.after(0, lambda: self._on_close_ok(pos["netuid"], result["result"]))
@@ -507,7 +573,7 @@ class Widget:
 
         if sig is None or not sig.get("prices"):
             # Fallback: show entry/current price from position data
-            positions = _strat_positions(snap.get("portfolio"))
+            positions = _strat_positions(snap.get("portfolio"), snap.get("flow_portfolio"))
             pos_data = None
             for pos in positions:
                 if pos["netuid"] == self.selected_netuid:
@@ -556,7 +622,7 @@ class Widget:
         ax.axhline(y=cur, color=GREY, linestyle="--", linewidth=0.7, alpha=0.6)
 
         # Entry price dotted (green/red)
-        positions = _strat_positions(snap.get("portfolio"))
+        positions = _strat_positions(snap.get("portfolio"), snap.get("flow_portfolio"))
         for pos in positions:
             if pos["netuid"] == self.selected_netuid:
                 ep = pos.get("entry_price", 0)
@@ -675,13 +741,13 @@ class Widget:
 
     # ── Flash animation ───────────────────────────────────────
 
-    def _flash_row(self, row: dict, colour: str, steps: int = 6):
-        """Pulse a row's background from `colour` back to BG_CARD."""
+    def _flash_row(self, row: dict, colour: str, steps: int = 6, target_bg: str = BG_CARD):
+        """Pulse a row's background from `colour` back to `target_bg`."""
         def _hex(c):
             return (int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16))
 
         src = _hex(colour)
-        dst = _hex(BG_CARD)
+        dst = _hex(target_bg)
 
         def _step(i):
             if i > steps:
@@ -707,12 +773,12 @@ class Widget:
 
         _step(0)
 
-    def _pack_position_row(self, i, positions, portfolio, usd, new_pos_ids):
+    def _pack_position_row(self, i, positions, portfolio, flow_portfolio, usd, new_pos_ids):
         """Configure and pack a single position row by flat index."""
         row = self._rows[i]
         pos = positions[i]
         netuid = pos["netuid"]
-        strat_key = pos.get("_strategy", "scalper")
+        strat_key = pos.get("_strategy") or "meanrev"
         name = pos.get("name", f"SN{netuid}")
         label = f"SN{netuid} {name}"
         if len(label) > 13:
@@ -721,7 +787,10 @@ class Widget:
         pnl = pos.get("pnl_pct", 0)
         sign = "+" if pnl >= 0 else ""
 
-        strat_data = (portfolio or {}).get(strat_key, {})
+        if strat_key == "flow":
+            strat_data = flow_portfolio or {}
+        else:
+            strat_data = (portfolio or {}).get(strat_key, {}) or {}
         stop_loss = strat_data.get("stop_loss_pct", 8.0)
         take_profit = strat_data.get("take_profit_pct", 20.0)
 
@@ -766,9 +835,9 @@ class Widget:
             if fw > 0:
                 cv.create_rectangle(1, 2, fw, bh, fill=RED, outline="")
 
-        # Highlight selected
+        # Tinted row background per strategy (brighter when selected)
         is_sel = (netuid == self.selected_netuid)
-        bg = BG_HEADER if is_sel else BG_CARD
+        bg = _row_bg(strat_key, selected=is_sel)
         row["frame"].configure(bg=bg)
         for k in ("stag", "name", "pnl", "pnl_abs", "tao", "close"):
             row[k].configure(bg=bg)
@@ -776,10 +845,10 @@ class Widget:
 
         row["frame"].pack(fill=tk.X, pady=1)
 
-        # Flash new positions green
+        # Flash new positions green, fading back to the tinted row bg
         pid_key = f"{strat_key}_{pos.get('position_id', netuid)}"
         if pid_key in new_pos_ids:
-            self._flash_row(row, GREEN)
+            self._flash_row(row, GREEN, target_bg=bg)
 
         # Auto-select first position
         if self.selected_netuid is None and i == 0:
@@ -796,6 +865,7 @@ class Widget:
 
         # Summary
         p = s["portfolio"]
+        fp = s.get("flow_portfolio")
         usd = s["tao_usd"]
 
         def _usd(tao: float) -> str:
@@ -807,7 +877,7 @@ class Widget:
             if wb is not None:
                 alpha_val = sum(
                     pos.get("amount_alpha", 0) * pos.get("current_price", 0)
-                    for pos in _strat_positions(p)
+                    for pos in _strat_positions(p, fp)
                 )
                 total = wb + alpha_val
                 self._lbl_wallet.configure(text=f"Wallet  {total:.2f} \u03c4{_usd(total)}")
@@ -819,9 +889,9 @@ class Widget:
         self._lbl_usd.configure(text=f"TAO/USD  ${usd:,.2f}" if usd else "TAO/USD  \u2014")
 
         # Per-strategy summary rows
-        for key in ("scalper", "trend"):
+        for key in _STRAT_KEYS:
             row = self._strat_rows[key]
-            strat = (p or {}).get(key, {})
+            strat = _strat_data(s, key)
             enabled = strat.get("enabled", False)
 
             if not enabled:
@@ -838,16 +908,13 @@ class Widget:
                 fg=GREEN if not dry else YELLOW,
             )
 
-            # Show EMA periods
-            fast = strat.get("signal_timeframe_hours", "")
-            # Try to extract EMA periods from the data
-            # The portfolio response includes confirm_bars, signal_timeframe_hours
-            # but not EMA periods directly - we get those from signals endpoint
+            # Show EMA periods (meanrev/trend only; flow has no EMA pair)
             ema_text = ""
-            for sig_strat in (s.get("strategies") or []):
-                if sig_strat.get("tag") == key:
-                    ema_text = f"{sig_strat['fast']}/{sig_strat['slow']}"
-                    break
+            if key != "flow":
+                for sig_strat in (s.get("strategies") or []):
+                    if sig_strat.get("tag") == key:
+                        ema_text = f"{sig_strat['fast']}/{sig_strat['slow']}"
+                        break
             row["ema"].configure(text=ema_text)
 
             pot = strat.get("pot_tao", 0)
@@ -858,8 +925,25 @@ class Widget:
             row["dep"].configure(text=f"Dep {dep:.1f}\u03c4")
             row["slots"].configure(text=f"{oc}/{mx}")
 
-        # Position rows — merged from both strategies
-        positions = _strat_positions(p)
+        # Flow warmup status line
+        flow_enabled = (fp or {}).get("enabled", False)
+        flow_sig = s.get("flow_signals") or {}
+        sig_list = flow_sig.get("signals") or []
+        cold_start = flow_sig.get("cold_start_snaps") or 624
+        if flow_enabled and sig_list:
+            ready = sum(1 for x in sig_list if (x.get("snapshots") or 0) >= cold_start)
+            total = len(sig_list)
+            if ready < total:
+                self._lbl_flow_warmup.configure(
+                    text=f"warmup: {ready}/{total} subnets ready", fg=ORANGE,
+                )
+            else:
+                self._lbl_flow_warmup.configure(text="", fg=ORANGE)
+        else:
+            self._lbl_flow_warmup.configure(text="", fg=ORANGE)
+
+        # Position rows — merged across strategies
+        positions = _strat_positions(p, fp)
 
         # Detect new / closed positions for flash
         cur_pos_ids = {f"{pos.get('_strategy', '')}_{pos.get('position_id', pos['netuid'])}" for pos in positions}
@@ -875,35 +959,18 @@ class Widget:
         has_positions = len(positions) > 0
 
         # Unpack everything so we can repack in strategy-grouped order
-        for hdr in self._pos_headers.values():
-            hdr["frame"].pack_forget()
         for row in self._rows:
             row["frame"].pack_forget()
         self._no_pos_lbl.pack_forget()
 
         if has_positions:
-            # Split positions by strategy for grouped headers
-            scalper_indices = [i for i, pos in enumerate(positions) if pos.get("_strategy", "scalper") == "scalper"]
-            trend_indices = [i for i, pos in enumerate(positions) if pos.get("_strategy") == "trend"]
-
-            # Update strategy header labels with count
-            for key, indices in [("scalper", scalper_indices), ("trend", trend_indices)]:
-                hdr = self._pos_headers[key]
-                ema_text = ""
-                for sig_strat in (s.get("strategies") or []):
-                    if sig_strat.get("tag") == key:
-                        ema_text = f" ({sig_strat['fast']}/{sig_strat['slow']})"
-                        break
-                hdr["label"].configure(text=f"{key.upper()}{ema_text}  \u2014  {len(indices)} open")
-
-            # Pack scalper group then trend group
-            for key, indices in [("scalper", scalper_indices), ("trend", trend_indices)]:
-                if not indices:
-                    continue
-                self._pos_headers[key]["frame"].pack(fill=tk.X, pady=(6, 2))
-                for i in indices:
-                    self._pack_position_row(i, positions, p, usd, new_pos_ids)
-
+            # Pack rows grouped by strategy (meanrev, trend, flow) — the
+            # per-row colour tint replaces the old group headers.
+            for key in _STRAT_KEYS:
+                default = "meanrev" if key == "meanrev" else None
+                for i, pos in enumerate(positions):
+                    if (pos.get("_strategy") or default) == key:
+                        self._pack_position_row(i, positions, p, fp, usd, new_pos_ids)
         else:
             self._no_pos_lbl.pack(fill=tk.X, pady=4)
 
