@@ -6,17 +6,50 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from app.config import settings
+from app.config import StrategyConfig
 from app.portfolio.ema_manager import EmaManager, EmaPosition
 from app.strategy.ema_signals import Candle, build_sampled_candles, bullish_ema_bounce, candle_close_prices
 
 
+def _test_config(**overrides) -> StrategyConfig:
+    defaults = {
+        "tag": "test",
+        "fast_period": 3,
+        "slow_period": 9,
+        "confirm_bars": 3,
+        "pot_tao": 10.0,
+        "position_size_pct": 0.20,
+        "max_positions": 5,
+        "stop_loss_pct": 8.0,
+        "take_profit_pct": 20.0,
+        "trailing_stop_pct": 5.0,
+        "breakeven_trigger_pct": 3.0,
+        "max_holding_hours": 168,
+        "cooldown_hours": 4.0,
+        "bounce_enabled": True,
+        "bounce_touch_tolerance_pct": 1.0,
+        "bounce_require_green": True,
+        "max_gini": 0.82,
+        "gini_cache_ttl_sec": 3600,
+        "correlation_threshold": 0.80,
+        "candle_timeframe_hours": 4,
+        "dry_run": True,
+        "max_slippage_pct": 5.0,
+        "max_entry_price_tao": 0.1,
+        "drawdown_breaker_pct": 15.0,
+        "drawdown_pause_hours": 6.0,
+        "fee_reserve_tao": 0.01,
+    }
+    defaults.update(overrides)
+    return StrategyConfig(**defaults)
+
+
 class TestEmaExitLogic:
-    def _make_manager(self) -> EmaManager:
-        return EmaManager(AsyncMock(), AsyncMock(), AsyncMock())
+    def _make_manager(self, **overrides) -> EmaManager:
+        return EmaManager(AsyncMock(), AsyncMock(), AsyncMock(), _test_config(**overrides))
 
     def test_ema_cross_still_drives_signal_exit(self):
-        mgr = self._make_manager()
+        mgr = self._make_manager(slow_period=3, confirm_bars=3)
         pos = EmaPosition(
             position_id=1,
             netuid=7,
@@ -27,12 +60,10 @@ class TestEmaExitLogic:
             entry_ts=datetime.now(timezone.utc).isoformat(),
         )
         prices = [10.0, 10.0, 10.0, 5.0, 5.0, 5.0]
-
-        with patch.object(settings, "EMA_PERIOD", 3), patch.object(settings, "EMA_CONFIRM_BARS", 3):
-            assert mgr._check_exit(pos, 5.0, prices) == "EMA_CROSS"
+        assert mgr._check_exit(pos, 5.0, prices) == "EMA_CROSS"
 
     def test_price_exit_helper_triggers_take_profit(self):
-        mgr = self._make_manager()
+        mgr = self._make_manager(take_profit_pct=10.0)
         pos = EmaPosition(
             position_id=1,
             netuid=7,
@@ -42,9 +73,7 @@ class TestEmaExitLogic:
             peak_price=1.11,
             entry_ts=datetime.now(timezone.utc).isoformat(),
         )
-
-        with patch.object(settings, "EMA_TAKE_PROFIT_PCT", 10.0):
-            assert mgr._check_price_exit(pos, 1.11) == "TAKE_PROFIT"
+        assert mgr._check_price_exit(pos, 1.11) == "TAKE_PROFIT"
 
 
 class TestEmaExitWatcher:
@@ -52,7 +81,7 @@ class TestEmaExitWatcher:
         db = AsyncMock()
         executor = AsyncMock()
         taostats = AsyncMock()
-        mgr = EmaManager(db, executor, taostats)
+        mgr = EmaManager(db, executor, taostats, _test_config(take_profit_pct=10.0, cooldown_hours=4.0))
         mgr._open = [
             EmaPosition(
                 position_id=11,
@@ -66,14 +95,10 @@ class TestEmaExitWatcher:
         ]
         executor.get_onchain_alpha_price = AsyncMock(return_value=1.11)
         executor.execute_swap = AsyncMock(
-            return_value=SimpleNamespace(success=True, received_tao=2.22)
+            return_value=SimpleNamespace(success=True, received_tao=2.22, received_alpha=2.0)
         )
 
-        with (
-            patch.object(settings, "EMA_TAKE_PROFIT_PCT", 10.0),
-            patch.object(settings, "EMA_COOLDOWN_HOURS", 4.0),
-            patch("app.portfolio.ema_manager.send_alert", new=AsyncMock()),
-        ):
+        with patch("app.portfolio.ema_manager.send_alert", new=AsyncMock()):
             summary = asyncio.run(mgr.run_price_exit_watch())
 
         assert summary["exits"]
@@ -124,15 +149,20 @@ class TestEmaBounceHelpers:
 
 
 class TestEmaBounceEntryFilter:
-    def _make_manager(self) -> tuple[EmaManager, AsyncMock]:
+    def _make_manager(self, **overrides) -> tuple[EmaManager, AsyncMock]:
         db = AsyncMock()
         executor = AsyncMock()
         taostats = AsyncMock()
-        mgr = EmaManager(db, executor, taostats)
+        mgr = EmaManager(db, executor, taostats, _test_config(**overrides))
         return mgr, taostats
 
     def test_run_cycle_skips_candidate_without_bullish_bounce(self):
-        mgr, taostats = self._make_manager()
+        mgr, taostats = self._make_manager(
+            fast_period=2, slow_period=3, confirm_bars=3,
+            candle_timeframe_hours=4, bounce_enabled=True,
+            bounce_touch_tolerance_pct=1.0, bounce_require_green=True,
+            max_entry_price_tao=100.0,
+        )
         taostats.get_alpha_prices = AsyncMock(return_value={42: 12.5})
         taostats._pool_snapshot = {
             42: {
@@ -151,14 +181,6 @@ class TestEmaBounceEntryFilter:
         mgr._enter = AsyncMock(return_value={"netuid": 42, "amount_tao": 4.0, "price": 12.5})
 
         with (
-            patch.object(settings, "EMA_FAST_PERIOD", 2),
-            patch.object(settings, "EMA_PERIOD", 3),
-            patch.object(settings, "EMA_CONFIRM_BARS", 3),
-            patch.object(settings, "EMA_CANDLE_TIMEFRAME_HOURS", 4),
-            patch.object(settings, "EMA_BOUNCE_ENABLED", True),
-            patch.object(settings, "EMA_BOUNCE_TOUCH_TOLERANCE_PCT", 1.0),
-            patch.object(settings, "EMA_BOUNCE_REQUIRE_GREEN", True),
-            patch.object(settings, "MAX_ENTRY_PRICE_TAO", 100.0),
             patch("app.portfolio.ema_manager.send_alert", new=AsyncMock()),
             patch.object(mgr, "_is_correlated_with_holdings", return_value=False),
         ):
@@ -168,7 +190,12 @@ class TestEmaBounceEntryFilter:
         mgr._enter.assert_not_awaited()
 
     def test_run_cycle_allows_candidate_after_bullish_ema_reclaim(self):
-        mgr, taostats = self._make_manager()
+        mgr, taostats = self._make_manager(
+            fast_period=2, slow_period=3, confirm_bars=3,
+            candle_timeframe_hours=4, bounce_enabled=True,
+            bounce_touch_tolerance_pct=1.0, bounce_require_green=True,
+            max_entry_price_tao=100.0,
+        )
         taostats.get_alpha_prices = AsyncMock(return_value={42: 13.0})
         taostats._pool_snapshot = {
             42: {
@@ -188,14 +215,6 @@ class TestEmaBounceEntryFilter:
         mgr._enter = AsyncMock(return_value={"netuid": 42, "amount_tao": 4.0, "price": 13.0})
 
         with (
-            patch.object(settings, "EMA_FAST_PERIOD", 2),
-            patch.object(settings, "EMA_PERIOD", 3),
-            patch.object(settings, "EMA_CONFIRM_BARS", 3),
-            patch.object(settings, "EMA_CANDLE_TIMEFRAME_HOURS", 4),
-            patch.object(settings, "EMA_BOUNCE_ENABLED", True),
-            patch.object(settings, "EMA_BOUNCE_TOUCH_TOLERANCE_PCT", 1.0),
-            patch.object(settings, "EMA_BOUNCE_REQUIRE_GREEN", True),
-            patch.object(settings, "MAX_ENTRY_PRICE_TAO", 100.0),
             patch("app.portfolio.ema_manager.send_alert", new=AsyncMock()),
             patch.object(mgr, "_is_correlated_with_holdings", return_value=False),
         ):

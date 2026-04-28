@@ -15,8 +15,7 @@ import sys
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.chain.executor import SwapExecutor
-from app.chain.flamewire_rpc import FlameWireRPC
-from app.config import settings
+from app.config import settings, flow_config, meanrev_config, strategy_b_config
 from app.data.taostats_client import TaostatsClient
 from app.logging.logger import logger
 from app.notifications.telegram import (
@@ -26,54 +25,188 @@ from app.notifications.telegram import (
     send_alert,
 )
 from app.portfolio.ema_manager import EmaManager
+from app.portfolio.pot_sizer import compute_pots
 from app.storage.db import Database
-from app.utils.time import utc_iso
+from app.strategy.regime import RegimeFilter
+from app.utils.time import utc_iso, utc_now
 
 db: Database | None = None
-rpc: FlameWireRPC | None = None
 executor: SwapExecutor | None = None
 taostats: TaostatsClient | None = None
-ema_portfolio: EmaManager | None = None
+ema_meanrev: EmaManager | None = None
+ema_trend: EmaManager | None = None
+ema_flow: EmaManager | None = None
+regime_filter: RegimeFilter | None = None
 scheduler: AsyncIOScheduler | None = None
 telegram_bot: TelegramBot | None = None
 _shutdown_event: asyncio.Event | None = None
-_ema_exit_watch_status: dict[str, object | None] = {
-    "last_run": None,
-    "last_error": None,
-    "last_exit_count": 0,
+_meanrev_exit_watch_status: dict[str, object | None] = {
+    "last_run": None, "last_error": None, "last_exit_count": 0,
 }
+_trend_exit_watch_status: dict[str, object | None] = {
+    "last_run": None, "last_error": None, "last_exit_count": 0,
+}
+_flow_exit_watch_status: dict[str, object | None] = {
+    "last_run": None, "last_error": None, "last_exit_count": 0,
+}
+_meanrev_entry_watch_status: dict[str, object | None] = {
+    "last_run": None, "last_error": None, "last_crossover_count": 0,
+}
+_trend_entry_watch_status: dict[str, object | None] = {
+    "last_run": None, "last_error": None, "last_crossover_count": 0,
+}
+_flow_entry_watch_status: dict[str, object | None] = {
+    "last_run": None, "last_error": None, "last_crossover_count": 0,
+}
+_flow_snapshot_status: dict[str, object | None] = {
+    "last_run": None, "last_error": None, "last_row_count": 0,
+}
+_ema_cycle_running: bool = False
+
+
+async def _get_open_netuids(mgr: EmaManager) -> set[int]:
+    """Return netuids currently held by a strategy manager."""
+    return {p.netuid for p in await mgr._open_positions_snapshot()}
+_last_wallet_balance_tao: float | None = None
+
+
+async def _apply_pot_sizing() -> tuple[dict[str, float], float | None]:
+    """Refresh wallet balance and mutate each manager's ``pot_tao`` per
+    ``EMA_POT_MODE``. Returns ``(pots, wallet_balance)`` where ``pots`` is
+    keyed by strategy tag (``meanrev``/``trend``/``flow``).
+
+    On wallet read failure in ``wallet_split`` mode, falls back to the
+    previous cycle's pot rather than zeroing mid-trade.
+    """
+    global _last_wallet_balance_tao
+    wallet_balance: float | None = None
+    if executor is not None:
+        try:
+            raw = float(await executor.get_tao_balance())
+            # get_tao_balance returns 0.0 when both SDK and Subtensor
+            # fallback fail (instead of raising).  Treat zero as a failed
+            # read so we don't poison pot_tao and false-trip the breaker.
+            if raw > 0:
+                wallet_balance = raw
+                _last_wallet_balance_tao = wallet_balance
+            else:
+                logger.warning("Wallet balance returned 0 — treating as failed read")
+                wallet_balance = _last_wallet_balance_tao
+        except Exception as exc:
+            logger.warning(f"Wallet balance read failed: {exc}")
+            wallet_balance = _last_wallet_balance_tao
+
+    pots = compute_pots(wallet_balance, settings)
+
+    # Sentinel: wallet_split with no balance available — keep existing pots.
+    if all(v < 0 for v in pots.values()):
+        pots = {
+            "meanrev": ema_meanrev._cfg.pot_tao if ema_meanrev else 0.0,
+            "trend": ema_trend._cfg.pot_tao if ema_trend else 0.0,
+            "flow": ema_flow._cfg.pot_tao if ema_flow else 0.0,
+        }
+
+    if ema_meanrev is not None:
+        ema_meanrev._cfg.pot_tao = pots["meanrev"]
+    if ema_trend is not None:
+        ema_trend._cfg.pot_tao = pots["trend"]
+    if ema_flow is not None:
+        ema_flow._cfg.pot_tao = pots["flow"]
+
+    return pots, wallet_balance
 _tao_usd_cache: dict[str, float | None] = {"price": None, "fetched_at": 0.0}
 
 
 async def init_services() -> None:
     """Initialize the EMA runtime and its shared infrastructure."""
-    global db, rpc, executor, taostats, ema_portfolio
+    global db, executor, taostats, ema_meanrev, ema_trend, ema_flow, regime_filter
 
-    logger.info("Initializing EMA services")
+    active = []
+    if settings.MR_ENABLED:
+        active.append("A")
+    if settings.EMA_B_ENABLED:
+        active.append("B")
+    if settings.FLOW_ENABLED:
+        active.append("FLOW")
+    logger.info(
+        f"Initializing services — active strategies: {active or ['NONE']}"
+    )
+    if not active:
+        logger.warning(
+            "MR_ENABLED, EMA_B_ENABLED, and FLOW_ENABLED are all false — no strategies will run"
+        )
+
+    prune_old_logs()
 
     db = Database()
     await db.connect()
 
-    rpc = FlameWireRPC()
-    if await rpc.health_check():
-        logger.info("FlameWire RPC health check passed")
-    else:
-        logger.warning("FlameWire RPC health check failed; continuing in degraded mode")
-
-    executor = SwapExecutor(rpc)
+    executor = SwapExecutor()
     await executor.initialize()
 
     taostats = TaostatsClient()
 
-    if settings.EMA_ENABLED:
-        ema_portfolio = EmaManager(db, executor, taostats)
-        await ema_portfolio.initialize()
+    regime_filter = RegimeFilter(db, settings)
+
+    if settings.MR_ENABLED:
+        ema_meanrev = EmaManager(db, executor, taostats, meanrev_config())
+        ema_meanrev._regime = regime_filter
+        await ema_meanrev.initialize()
+
+    if settings.EMA_B_ENABLED:
+        ema_trend = EmaManager(db, executor, taostats, strategy_b_config())
+        ema_trend._regime = regime_filter
+        await ema_trend.initialize()
+
+    if settings.FLOW_ENABLED:
+        ema_flow = EmaManager(db, executor, taostats, flow_config())
+        ema_flow._regime = regime_filter
+        await ema_flow.initialize()
+
+    # Wire companion exit callbacks so whichever strategy exits a dual-held
+    # subnet can immediately close the other strategy's ghost position.
+    if ema_meanrev and ema_trend:
+        ema_meanrev._companion_exit_cb = ema_trend.on_companion_exit
+        ema_trend._companion_exit_cb = ema_meanrev.on_companion_exit
+        # Wire companion netuid callbacks for entry watcher cross-exclusion
+        ema_meanrev._companion_netuids_cb = (
+            lambda: _get_open_netuids(ema_trend)
+        )
+        ema_trend._companion_netuids_cb = (
+            lambda: _get_open_netuids(ema_meanrev)
+        )
+
+    # Flow runs alongside — its entries are blocked from any subnet held by
+    # another strategy. Exits propagate one-way (Flow → EMA only) to avoid
+    # cascading closes when EMA strategies exit for their own reasons.
+    if ema_flow:
+        async def _all_other_netuids() -> set[int]:
+            out: set[int] = set()
+            if ema_meanrev:
+                out |= await _get_open_netuids(ema_meanrev)
+            if ema_trend:
+                out |= await _get_open_netuids(ema_trend)
+            return out
+        ema_flow._companion_netuids_cb = _all_other_netuids
+
+    # Set root claim type to "Keep" so emissions accumulate as alpha
+    any_live = (
+        settings.MR_ENABLED
+        or (settings.EMA_B_ENABLED and not settings.EMA_B_DRY_RUN)
+        or (settings.FLOW_ENABLED and not settings.FLOW_DRY_RUN)
+    )
+    if any_live:
+        await executor.ensure_root_claim_keep()
 
     logger.info(
-        "EMA services initialized",
+        "Services initialized",
         data={
-            "ema_enabled": settings.EMA_ENABLED,
-            "ema_dry_run": settings.EMA_DRY_RUN,
+            "meanrev_enabled": settings.MR_ENABLED,
+            "meanrev_dry_run": False,
+            "trend_enabled": settings.EMA_B_ENABLED,
+            "trend_dry_run": settings.EMA_B_DRY_RUN,
+            "flow_enabled": settings.FLOW_ENABLED,
+            "flow_dry_run": settings.FLOW_DRY_RUN,
             "scan_interval_min": settings.SCAN_INTERVAL_MIN,
             "exit_watcher_enabled": settings.EMA_EXIT_WATCHER_ENABLED,
         },
@@ -89,8 +222,6 @@ async def shutdown_services() -> None:
 
     if taostats:
         await taostats.close()
-    if rpc:
-        await rpc.close()
     if db:
         await db.close()
 
@@ -98,126 +229,497 @@ async def shutdown_services() -> None:
 
 
 async def run_ema_cycle() -> None:
-    """Execute one EMA scan and trade cycle."""
-    if ema_portfolio is None:
-        logger.warning("EMA manager not initialized")
+    """Execute one EMA scan and trade cycle for all active strategies."""
+    global _ema_cycle_running
+    if ema_meanrev is None and ema_trend is None and ema_flow is None:
+        logger.warning("No strategy managers initialized")
         return
     if os.path.exists(settings.KILL_SWITCH_PATH):
-        logger.warning("KILL_SWITCH active; skipping EMA cycle")
+        logger.warning("KILL_SWITCH active; skipping cycle")
+        return
+    if _ema_cycle_running:
+        logger.warning("Cycle already in progress; skipping")
         return
 
+    _ema_cycle_running = True
     try:
-        logger.info(f"Starting EMA cycle at {utc_iso()}")
-        summary = await ema_portfolio.run_cycle()
-        logger.info("EMA cycle complete", data=summary)
+        logger.info(f"Starting strategy cycle at {utc_iso()}")
+        await _apply_pot_sizing()
+        # Persist pool snapshots before scans so flow strategy has fresh data.
+        if settings.FLOW_PERSIST_SNAPSHOTS:
+            await _persist_pool_snapshots()
+        # Collect occupied netuids from each strategy for cross-exclusion
+        meanrev_netuids: set[int] = set()
+        trend_netuids: set[int] = set()
+        flow_netuids: set[int] = set()
+        if ema_meanrev:
+            meanrev_netuids = {p.netuid for p in await ema_meanrev._open_positions_snapshot()}
+        if ema_trend:
+            trend_netuids = {p.netuid for p in await ema_trend._open_positions_snapshot()}
+        if ema_flow:
+            flow_netuids = {p.netuid for p in await ema_flow._open_positions_snapshot()}
+
+        if ema_meanrev:
+            summary = await ema_meanrev.run_cycle(
+                globally_occupied=trend_netuids | flow_netuids
+            )
+            logger.info("Mean-Reversion cycle complete", data=summary)
+            meanrev_netuids = {p.netuid for p in await ema_meanrev._open_positions_snapshot()}
+        if ema_trend:
+            summary = await ema_trend.run_cycle(
+                globally_occupied=meanrev_netuids | flow_netuids
+            )
+            logger.info("Trend cycle complete", data=summary)
+            trend_netuids = {p.netuid for p in await ema_trend._open_positions_snapshot()}
+        if ema_flow:
+            summary = await ema_flow.run_cycle(
+                globally_occupied=meanrev_netuids | trend_netuids
+            )
+            logger.info("Flow cycle complete", data=summary)
     except Exception as exc:
-        logger.error(f"EMA cycle failed: {exc}", data={"error": str(exc)})
+        logger.error(f"Strategy cycle failed: {exc}", data={"error": str(exc)})
+    finally:
+        _ema_cycle_running = False
 
 
-async def run_ema_exit_watch() -> None:
-    """Execute the lightweight EMA exit watcher."""
-    global _ema_exit_watch_status
-
-    if ema_portfolio is None or not settings.EMA_EXIT_WATCHER_ENABLED:
+async def _persist_pool_snapshots() -> None:
+    """Persist one pool snapshot per subnet for the flow strategy."""
+    global _flow_snapshot_status
+    if db is None or taostats is None:
         return
-    if os.path.exists(settings.KILL_SWITCH_PATH):
-        return
-
     try:
-        summary = await ema_portfolio.run_price_exit_watch()
-        _ema_exit_watch_status = {
-            "last_run": utc_iso(),
+        # Ensure taostats cache is warm — get_alpha_prices refreshes the pool
+        # snapshot when its TTL expires and is cheap when fresh.
+        await taostats.get_alpha_prices()
+        reserves = taostats.all_pool_reserves()
+        if not reserves:
+            _flow_snapshot_status = {
+                "last_run": utc_iso(),
+                "last_error": "no pool snapshot cached",
+                "last_row_count": 0,
+            }
+            return
+        ts = utc_iso()
+        rows = [{"ts": ts, **r} for r in reserves]
+        await db.save_pool_snapshots_bulk(rows)
+        _flow_snapshot_status = {
+            "last_run": ts,
             "last_error": None,
-            "last_exit_count": len(summary.get("exits", [])),
+            "last_row_count": len(rows),
         }
-        if summary.get("exits"):
-            logger.info("EMA exit watcher complete", data=summary)
     except Exception as exc:
-        _ema_exit_watch_status = {
+        _flow_snapshot_status = {
             "last_run": utc_iso(),
             "last_error": str(exc),
-            "last_exit_count": 0,
+            "last_row_count": 0,
         }
-        logger.error(f"EMA exit watcher failed: {exc}", data={"error": str(exc)})
+        logger.error(f"Pool snapshot persistence failed: {exc}")
+
+
+async def prune_pool_snapshots_job() -> None:
+    """Prune pool_snapshots older than FLOW_SNAPSHOT_RETENTION_HOURS."""
+    if db is None:
+        return
+    try:
+        from datetime import timedelta
+        cutoff_dt = utc_now() - timedelta(hours=settings.FLOW_SNAPSHOT_RETENTION_HOURS)
+        removed = await db.prune_pool_snapshots(cutoff_dt.isoformat())
+        if removed:
+            logger.info(
+                f"Pruned {removed} old pool snapshots",
+                data={"removed": removed, "retention_hours": settings.FLOW_SNAPSHOT_RETENTION_HOURS},
+            )
+    except Exception as exc:
+        logger.error(f"Pool snapshot prune failed: {exc}")
+
+
+async def _detect_dual_held_netuids() -> set[int]:
+    """Return netuids held by both the meanrev and trend strategies."""
+    if not ema_meanrev or not ema_trend:
+        return set()
+    meanrev = {p.netuid for p in await ema_meanrev._open_positions_snapshot()}
+    trend = {p.netuid for p in await ema_trend._open_positions_snapshot()}
+    overlap = meanrev & trend
+    if overlap:
+        logger.warning(f"Dual-held subnets detected: {overlap}")
+    return overlap
+
+
+async def run_meanrev_exit_watch() -> None:
+    """Execute the lightweight exit watcher for the Mean-Reversion strategy."""
+    global _meanrev_exit_watch_status
+    if ema_meanrev is None or not settings.EMA_EXIT_WATCHER_ENABLED:
+        return
+    if os.path.exists(settings.KILL_SWITCH_PATH):
+        return
+    try:
+        dual = await _detect_dual_held_netuids()
+        summary = await ema_meanrev.run_price_exit_watch(dual_held_netuids=dual)
+        _meanrev_exit_watch_status = {
+            "last_run": utc_iso(), "last_error": None,
+            "last_exit_count": len(summary.get("exits", [])),
+        }
+        if summary.get("exits") or summary.get("deferred"):
+            logger.info("Mean-Reversion exit watcher complete", data=summary)
+    except Exception as exc:
+        _meanrev_exit_watch_status = {
+            "last_run": utc_iso(), "last_error": str(exc), "last_exit_count": 0,
+        }
+        logger.error(f"Mean-Reversion exit watcher failed: {exc}", data={"error": str(exc)})
+
+
+async def run_trend_exit_watch() -> None:
+    """Execute the lightweight exit watcher for the Trend strategy."""
+    global _trend_exit_watch_status
+    if ema_trend is None or not settings.EMA_EXIT_WATCHER_ENABLED:
+        return
+    if os.path.exists(settings.KILL_SWITCH_PATH):
+        return
+    try:
+        dual = await _detect_dual_held_netuids()
+        summary = await ema_trend.run_price_exit_watch(dual_held_netuids=dual)
+        _trend_exit_watch_status = {
+            "last_run": utc_iso(), "last_error": None,
+            "last_exit_count": len(summary.get("exits", [])),
+        }
+        if summary.get("exits") or summary.get("deferred"):
+            logger.info("Trend exit watcher complete", data=summary)
+    except Exception as exc:
+        _trend_exit_watch_status = {
+            "last_run": utc_iso(), "last_error": str(exc), "last_exit_count": 0,
+        }
+        logger.error(f"Trend exit watcher failed: {exc}", data={"error": str(exc)})
+
+
+async def run_flow_exit_watch() -> None:
+    """Execute the lightweight exit watcher for the Flow strategy."""
+    global _flow_exit_watch_status
+    if ema_flow is None or not settings.EMA_EXIT_WATCHER_ENABLED:
+        return
+    if os.path.exists(settings.KILL_SWITCH_PATH):
+        return
+    try:
+        summary = await ema_flow.run_price_exit_watch(dual_held_netuids=set())
+        _flow_exit_watch_status = {
+            "last_run": utc_iso(), "last_error": None,
+            "last_exit_count": len(summary.get("exits", [])),
+        }
+        if summary.get("exits") or summary.get("deferred"):
+            logger.info("Flow exit watcher complete", data=summary)
+    except Exception as exc:
+        _flow_exit_watch_status = {
+            "last_run": utc_iso(), "last_error": str(exc), "last_exit_count": 0,
+        }
+        logger.error(f"Flow exit watcher failed: {exc}", data={"error": str(exc)})
+
+
+async def run_meanrev_entry_watch() -> None:
+    """Lightweight entry poll for the Mean-Reversion strategy."""
+    global _meanrev_entry_watch_status
+    if ema_meanrev is None or not settings.EMA_ENTRY_WATCHER_ENABLED:
+        return
+    if os.path.exists(settings.KILL_SWITCH_PATH):
+        return
+    if _ema_cycle_running:
+        return
+    try:
+        summary = await ema_meanrev.run_entry_watch()
+        _meanrev_entry_watch_status = {
+            "last_run": utc_iso(), "last_error": None,
+            "last_crossover_count": len(summary.get("new_crossovers", [])),
+        }
+        if summary.get("new_crossovers"):
+            logger.info("Mean-Reversion entry watcher: signals triggered cycle", data=summary)
+    except Exception as exc:
+        _meanrev_entry_watch_status = {
+            "last_run": utc_iso(), "last_error": str(exc), "last_crossover_count": 0,
+        }
+        logger.error(f"Mean-Reversion entry watcher failed: {exc}", data={"error": str(exc)})
+
+
+async def run_trend_entry_watch() -> None:
+    """Lightweight entry crossover poll for the Trend strategy."""
+    global _trend_entry_watch_status
+    if ema_trend is None or not settings.EMA_ENTRY_WATCHER_ENABLED:
+        return
+    if os.path.exists(settings.KILL_SWITCH_PATH):
+        return
+    if _ema_cycle_running:
+        return
+    try:
+        summary = await ema_trend.run_entry_watch()
+        _trend_entry_watch_status = {
+            "last_run": utc_iso(), "last_error": None,
+            "last_crossover_count": len(summary.get("new_crossovers", [])),
+        }
+        if summary.get("new_crossovers"):
+            logger.info("Trend entry watcher: crossovers triggered cycle", data=summary)
+    except Exception as exc:
+        _trend_entry_watch_status = {
+            "last_run": utc_iso(), "last_error": str(exc), "last_crossover_count": 0,
+        }
+        logger.error(f"Trend entry watcher failed: {exc}", data={"error": str(exc)})
+
+
+async def run_flow_entry_watch() -> None:
+    """Lightweight entry poll for the Flow strategy."""
+    global _flow_entry_watch_status
+    if ema_flow is None or not settings.EMA_ENTRY_WATCHER_ENABLED:
+        return
+    if os.path.exists(settings.KILL_SWITCH_PATH):
+        return
+    if _ema_cycle_running:
+        return
+    try:
+        summary = await ema_flow.run_entry_watch()
+        _flow_entry_watch_status = {
+            "last_run": utc_iso(), "last_error": None,
+            "last_crossover_count": len(summary.get("new_crossovers", [])),
+        }
+        if summary.get("new_crossovers"):
+            logger.info("Flow entry watcher: signals triggered cycle", data=summary)
+    except Exception as exc:
+        _flow_entry_watch_status = {
+            "last_run": utc_iso(), "last_error": str(exc), "last_crossover_count": 0,
+        }
+        logger.error(f"Flow entry watcher failed: {exc}", data={"error": str(exc)})
+
+
+async def run_root_claim() -> None:
+    """Claim accumulated root emissions for all netuids with open positions."""
+    if executor is None:
+        return
+    mr_live = settings.MR_ENABLED
+    trend_live = settings.EMA_B_ENABLED and not settings.EMA_B_DRY_RUN
+    flow_live = settings.FLOW_ENABLED and not settings.FLOW_DRY_RUN
+    if not mr_live and not trend_live and not flow_live:
+        return
+
+    netuids: set[int] = set()
+    if ema_meanrev:
+        netuids |= {p.netuid for p in await ema_meanrev._open_positions_snapshot()}
+    if ema_trend:
+        netuids |= {p.netuid for p in await ema_trend._open_positions_snapshot()}
+    if ema_flow:
+        netuids |= {p.netuid for p in await ema_flow._open_positions_snapshot()}
+
+    if not netuids:
+        logger.debug("Root claim: no open positions, skipping")
+        return
+
+    sorted_netuids = sorted(netuids)
+    logger.info(f"Claiming root emissions for netuids {sorted_netuids}")
+    ok = await executor.claim_root_emissions(sorted_netuids)
+    if ok:
+        logger.info(f"Root emissions claimed successfully for {sorted_netuids}")
+    else:
+        logger.warning(f"Root emission claim had failures for {sorted_netuids}")
+
+
+def prune_old_logs() -> None:
+    """Delete JSONL files in ``settings.JSONL_DIR`` older than
+    ``LOG_RETENTION_DAYS``. Matches both ``YYYY-MM-DD.jsonl`` and rotated
+    ``YYYY-MM-DD.jsonl.N`` files. Best-effort: errors are logged, never raised.
+    """
+    import re
+    from datetime import datetime, timedelta, timezone
+
+    directory = settings.JSONL_DIR
+    days = max(0, int(settings.LOG_RETENTION_DAYS))
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days)
+    pattern = re.compile(r"^(\d{4}-\d{2}-\d{2})\.jsonl(?:\.\d+)?$")
+    removed = 0
+    try:
+        entries = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    for name in entries:
+        m = pattern.match(name)
+        if not m:
+            continue
+        try:
+            file_date = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            try:
+                os.remove(os.path.join(directory, name))
+                removed += 1
+            except OSError as exc:
+                logger.warning(f"Failed to prune log {name}: {exc}")
+    if removed:
+        logger.info(
+            f"Pruned {removed} old log file(s) older than {days}d",
+            data={"removed": removed, "retention_days": days},
+        )
 
 
 def setup_scheduler() -> AsyncIOScheduler:
-    """Configure the EMA scheduler."""
+    """Configure the strategy scheduler."""
     sched = AsyncIOScheduler()
-    if settings.EMA_ENABLED:
+    if settings.MR_ENABLED or settings.EMA_B_ENABLED or settings.FLOW_ENABLED:
         sched.add_job(
             run_ema_cycle,
             trigger="interval",
             minutes=settings.SCAN_INTERVAL_MIN,
             id="ema_cycle",
-            name="EMA Trend Scanner",
+            name="Strategy Scanner",
             max_instances=1,
             misfire_grace_time=60,
         )
-        if settings.EMA_EXIT_WATCHER_ENABLED:
-            sched.add_job(
-                run_ema_exit_watch,
-                trigger="interval",
-                seconds=settings.EMA_EXIT_WATCHER_SEC,
-                id="ema_exit_watch",
-                name="EMA Exit Watcher",
-                max_instances=1,
-                misfire_grace_time=max(settings.EMA_EXIT_WATCHER_SEC, 5),
-            )
+    if settings.FLOW_ENABLED and settings.FLOW_PERSIST_SNAPSHOTS:
+        sched.add_job(
+            prune_pool_snapshots_job,
+            trigger="interval",
+            hours=1,
+            id="flow_snapshot_prune",
+            name="Pool Snapshot Retention",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+    if settings.MR_ENABLED and settings.EMA_EXIT_WATCHER_ENABLED:
+        sched.add_job(
+            run_meanrev_exit_watch,
+            trigger="interval",
+            seconds=settings.EMA_EXIT_WATCHER_SEC,
+            id="meanrev_exit_watch",
+            name="Mean-Reversion Exit Watcher",
+            max_instances=1,
+            misfire_grace_time=max(settings.EMA_EXIT_WATCHER_SEC, 5),
+        )
+    if settings.EMA_B_ENABLED and settings.EMA_EXIT_WATCHER_ENABLED:
+        sched.add_job(
+            run_trend_exit_watch,
+            trigger="interval",
+            seconds=settings.EMA_EXIT_WATCHER_SEC,
+            id="trend_exit_watch",
+            name="Trend Exit Watcher",
+            max_instances=1,
+            misfire_grace_time=max(settings.EMA_EXIT_WATCHER_SEC, 5),
+        )
+    if settings.FLOW_ENABLED and settings.EMA_EXIT_WATCHER_ENABLED:
+        sched.add_job(
+            run_flow_exit_watch,
+            trigger="interval",
+            seconds=settings.EMA_EXIT_WATCHER_SEC,
+            id="flow_exit_watch",
+            name="Flow Exit Watcher",
+            max_instances=1,
+            misfire_grace_time=max(settings.EMA_EXIT_WATCHER_SEC, 5),
+        )
+    if settings.MR_ENABLED and settings.EMA_ENTRY_WATCHER_ENABLED:
+        sched.add_job(
+            run_meanrev_entry_watch,
+            trigger="interval",
+            seconds=settings.EMA_ENTRY_WATCHER_SEC,
+            id="meanrev_entry_watch",
+            name="Mean-Reversion Entry Watcher",
+            max_instances=1,
+            misfire_grace_time=max(settings.EMA_ENTRY_WATCHER_SEC, 5),
+        )
+    if settings.EMA_B_ENABLED and settings.EMA_ENTRY_WATCHER_ENABLED:
+        sched.add_job(
+            run_trend_entry_watch,
+            trigger="interval",
+            seconds=settings.EMA_ENTRY_WATCHER_SEC,
+            id="trend_entry_watch",
+            name="Trend Entry Watcher",
+            max_instances=1,
+            misfire_grace_time=max(settings.EMA_ENTRY_WATCHER_SEC, 5),
+        )
+    if settings.FLOW_ENABLED and settings.EMA_ENTRY_WATCHER_ENABLED:
+        sched.add_job(
+            run_flow_entry_watch,
+            trigger="interval",
+            seconds=settings.EMA_ENTRY_WATCHER_SEC,
+            id="flow_entry_watch",
+            name="Flow Entry Watcher",
+            max_instances=1,
+            misfire_grace_time=max(settings.EMA_ENTRY_WATCHER_SEC, 5),
+        )
+    # Prune old JSONL logs daily (and once at startup, see init_services)
+    sched.add_job(
+        prune_old_logs,
+        trigger="interval",
+        hours=24,
+        id="log_retention",
+        name="Log Retention",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+    # Claim root emissions every 6 hours for open positions
+    any_live = (
+        settings.MR_ENABLED
+        or (settings.EMA_B_ENABLED and not settings.EMA_B_DRY_RUN)
+        or (settings.FLOW_ENABLED and not settings.FLOW_DRY_RUN)
+    )
+    if any_live:
+        sched.add_job(
+            run_root_claim,
+            trigger="interval",
+            hours=6,
+            id="root_claim",
+            name="Root Emission Claimer",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
     return sched
 
 
 def _telegram_help_text() -> str:
     return (
-        "🤖 <b>EMA Telegram Commands</b>\n"
-        "<code>/status</code> current EMA runtime status\n"
-        "<code>/positions [limit]</code> open EMA positions\n"
-        "<code>/close &lt;position_id|sn42&gt;</code> close one position\n"
-        "<code>/pause</code> enable kill switch\n"
-        "<code>/resume</code> clear kill switch\n"
-        "<code>/run</code> trigger one EMA cycle\n"
-        "<code>/export</code> send the EMA trades CSV"
+        "🤖 <b>EMA Telegram Commands</b>\n\n"
+        "<code>/status</code> — current EMA runtime status\n"
+        "<code>/positions [limit]</code> — open EMA positions\n"
+        "<code>/close &lt;netuid&gt;</code> — close a position (e.g. /close 32)\n"
+        "<code>/history [limit]</code> — recent closed trades\n"
+        "<code>/pause</code> — enable kill switch\n"
+        "<code>/resume</code> — clear kill switch\n"
+        "<code>/run</code> — trigger one EMA cycle\n"
+        "<code>/export</code> — send the EMA trades CSV"
     )
 
 
 async def _telegram_status_text() -> str:
-    if ema_portfolio is None:
+    if ema_meanrev is None and ema_trend is None:
         return "EMA runtime is still initializing."
 
     alpha_prices = await taostats.get_alpha_prices() if taostats else {}
-    summary = ema_portfolio.get_portfolio_summary(alpha_prices)
     next_cycle = None
     if scheduler:
         job = scheduler.get_job("ema_cycle")
         if job and job.next_run_time:
             next_cycle = job.next_run_time.isoformat()
 
-    total_pnl_tao = summary["pot_tao"] - settings.EMA_POT_TAO
-    total_pnl_pct = (
-        total_pnl_tao / settings.EMA_POT_TAO * 100.0 if settings.EMA_POT_TAO > 0 else 0.0
-    )
     lines = [
-        "🤖 <b>EMA Status</b>",
-        f"Mode: {'LIVE' if not settings.EMA_DRY_RUN else 'DRY RUN'}",
+        "🤖 <b>EMA Dual Status</b>",
         f"Trading: {'PAUSED' if os.path.exists(settings.KILL_SWITCH_PATH) else 'RUNNING'}",
         f"Next cycle: {next_cycle or 'n/a'}",
-        f"Open positions: {summary['open_count']}/{summary['max_positions']}",
-        f"Pot: {summary['pot_tao']:.4f} τ",
-        f"Deployed: {summary['deployed_tao']:.4f} τ",
-        f"Unstaked: {summary['unstaked_tao']:.4f} τ",
-        f"PnL: {total_pnl_tao:+.4f} τ ({total_pnl_pct:+.2f}%)",
-        f"Circuit breaker: {'ACTIVE' if summary['breaker_active'] else 'off'}",
-        (
-            f"Exit watcher: on ({settings.EMA_EXIT_WATCHER_SEC}s)"
-            if settings.EMA_EXIT_WATCHER_ENABLED
-            else "Exit watcher: off"
-        ),
     ]
+
+    for label, mgr in [("Mean-Reversion", ema_meanrev), ("Trend", ema_trend), ("Flow", ema_flow)]:
+        if mgr is None:
+            lines.append(f"\n<b>{label}</b>: disabled")
+            continue
+        summary = mgr.get_portfolio_summary(alpha_prices)
+        mode = "LIVE" if not mgr._cfg.dry_run else "DRY"
+        unrealized = sum(
+            (p["current_price"] - p["entry_price"]) / p["entry_price"] * p["amount_tao"]
+            if p["entry_price"] else 0.0
+            for p in summary["open_positions"]
+        )
+        total_pnl = (summary["pot_tao"] - mgr._cfg.pot_tao) + unrealized
+        lines.append(
+            f"\n<b>{label} {mgr._cfg.fast_period}/{mgr._cfg.slow_period}</b> ({mode})"
+        )
+        lines.append(f"  Positions: {summary['open_count']}/{summary['max_positions']}")
+        lines.append(f"  Pot: {summary['pot_tao']:.4f} τ | Deployed: {summary['deployed_tao']:.4f} τ")
+        lines.append(f"  PnL: {total_pnl:+.4f} τ | Breaker: {'ACTIVE' if summary['breaker_active'] else 'off'}")
 
     if executor is not None:
         try:
             wallet_balance = await executor.get_tao_balance()
-            lines.append(f"Wallet balance: {wallet_balance:.4f} τ")
+            lines.append(f"\nWallet: {wallet_balance:.4f} τ")
         except Exception:
             pass
 
@@ -225,27 +727,30 @@ async def _telegram_status_text() -> str:
 
 
 async def _telegram_positions_text(limit: int) -> str:
-    if ema_portfolio is None:
-        return "EMA runtime is still initializing."
+    if ema_meanrev is None and ema_trend is None and ema_flow is None:
+        return "Runtime is still initializing."
 
     alpha_prices = await taostats.get_alpha_prices() if taostats else {}
-    summary = ema_portfolio.get_portfolio_summary(alpha_prices)
-    positions = summary["open_positions"]
-    if not positions:
-        return "📂 <b>Open EMA Positions</b>\nNo open EMA positions."
-
     snapshot = taostats._pool_snapshot if taostats else {}
     limit = max(1, min(limit, 20))
-    lines = ["📂 <b>Open EMA Positions</b>"]
-    for pos in positions[:limit]:
-        name = snapshot.get(pos["netuid"], {}).get("name", "") or f"SN{pos['netuid']}"
-        lines.append(
-            f"#{pos['position_id']} {html.escape(name)} (SN{pos['netuid']}) | "
-            f"{pos['pnl_pct']:+.2f}% | {pos['amount_tao']:.4f} τ | {pos['hours_held']:.1f}h"
-        )
+    lines = ["📂 <b>Open Positions</b>"]
+    total = 0
 
-    if len(positions) > limit:
-        lines.append(f"... {len(positions) - limit} more open position(s)")
+    for label, mgr in [("MR", ema_meanrev), ("TRD", ema_trend), ("FLW", ema_flow)]:
+        if mgr is None:
+            continue
+        summary = mgr.get_portfolio_summary(alpha_prices)
+        positions = summary["open_positions"]
+        total += len(positions)
+        for pos in positions[:limit]:
+            name = snapshot.get(pos["netuid"], {}).get("name", "") or f"SN{pos['netuid']}"
+            lines.append(
+                f"[{label}] #{pos['position_id']} {html.escape(name)} (SN{pos['netuid']}) | "
+                f"{pos['pnl_pct']:+.2f}% | {pos['amount_tao']:.4f} τ | {pos['hours_held']:.1f}h"
+            )
+
+    if total == 0:
+        lines.append("No open EMA positions.")
     return "\n".join(lines)
 
 
@@ -266,60 +771,71 @@ async def _telegram_resume_text() -> str:
 
 
 async def _telegram_run_cycle_text() -> str:
-    if ema_portfolio is None:
-        return "EMA runtime is still initializing."
+    if ema_meanrev is None and ema_trend is None and ema_flow is None:
+        return "Runtime is still initializing."
     if os.path.exists(settings.KILL_SWITCH_PATH):
         return "Kill switch is active. Use <code>/resume</code> before triggering a cycle."
+    if _ema_cycle_running:
+        return "⏳ <b>EMA cycle already running</b>\nWait for the current cycle to finish."
 
     asyncio.create_task(run_ema_cycle())
     return "🟢 <b>EMA cycle triggered</b>\nA manual scan has been queued."
 
 
 async def _telegram_close_text(target: str) -> str:
-    if ema_portfolio is None:
+    if ema_meanrev is None and ema_trend is None:
         return "EMA runtime is still initializing."
 
     alpha_prices = await taostats.get_alpha_prices() if taostats else {}
-    summary = ema_portfolio.get_portfolio_summary(alpha_prices)
-    positions = summary["open_positions"]
-    if not positions:
-        return "No open EMA positions to close."
 
-    normalized = target.strip().lower()
-    if normalized.startswith("#"):
-        normalized = normalized[1:]
+    try:
+        netuid = int(target.strip())
+    except ValueError:
+        return "Usage: <code>/close 32</code> (subnet number)"
 
-    selected = None
-    if normalized.startswith("sn"):
-        try:
-            netuid = int(normalized[2:])
-        except ValueError:
-            return "Usage: <code>/close &lt;position_id|sn42&gt;</code>"
-        selected = next((pos for pos in positions if pos["netuid"] == netuid), None)
-    else:
-        try:
-            numeric = int(normalized)
-        except ValueError:
-            return "Usage: <code>/close &lt;position_id|sn42&gt;</code>"
-        selected = next((pos for pos in positions if pos["position_id"] == numeric), None)
-        if selected is None:
-            selected = next((pos for pos in positions if pos["netuid"] == numeric), None)
+    # Search all strategies for the position
+    for mgr in [ema_meanrev, ema_trend, ema_flow]:
+        if mgr is None:
+            continue
+        summary = mgr.get_portfolio_summary(alpha_prices)
+        selected = next((p for p in summary["open_positions"] if p["netuid"] == netuid), None)
+        if selected:
+            result = await mgr.manual_close(selected["position_id"])
+            if result is None:
+                return "That EMA position is already closing or no longer available."
+            snapshot = taostats._pool_snapshot if taostats else {}
+            name = snapshot.get(result["netuid"], {}).get("name", "") or f"SN{result['netuid']}"
+            return (
+                f"📉 <b>[{mgr._cfg.tag.upper()}] manual close</b>\n"
+                f"{html.escape(name)} (SN{result['netuid']})\n"
+                f"Reason: {result['reason']}\n"
+                f"PnL: {result['pnl_pct']:+.2f}% ({result['pnl_tao']:+.4f} τ)"
+            )
 
-    if selected is None:
-        return f"No open EMA position matches <code>{html.escape(target)}</code>."
+    return f"No open EMA position for SN{netuid}."
 
-    result = await ema_portfolio.manual_close(selected["position_id"])
-    if result is None:
-        return "That EMA position is already closing or no longer available."
+
+async def _telegram_history_text(limit: int) -> str:
+    if db is None:
+        return "Trade history is unavailable while the database is still initializing."
+
+    rows = await db.get_closed_ema_positions(limit=limit)
+    if not rows:
+        return "📋 <b>Recent Closed Trades</b>\nNo closed EMA trades yet."
 
     snapshot = taostats._pool_snapshot if taostats else {}
-    name = snapshot.get(result["netuid"], {}).get("name", "") or f"SN{result['netuid']}"
-    return (
-        f"📉 <b>EMA manual close</b>\n"
-        f"{html.escape(name)} (SN{result['netuid']})\n"
-        f"Reason: {result['reason']}\n"
-        f"PnL: {result['pnl_pct']:+.2f}% ({result['pnl_tao']:+.4f} τ)"
-    )
+    lines = ["📋 <b>Recent Closed Trades</b>"]
+    for row in rows:
+        name = snapshot.get(row["netuid"], {}).get("name", "") or f"SN{row['netuid']}"
+        pnl_tao = row.get("pnl_tao") or 0.0
+        pnl_pct = row.get("pnl_pct") or 0.0
+        reason = row.get("exit_reason") or "?"
+        exit_ts = (row.get("exit_ts") or "")[:16]
+        lines.append(
+            f"#{row['id']} {html.escape(name)} (SN{row['netuid']}) | "
+            f"{pnl_pct:+.2f}% ({pnl_tao:+.4f} τ) | {reason} | {exit_ts}"
+        )
+    return "\n".join(lines)
 
 
 async def _telegram_export_result() -> str | TelegramDocument:
@@ -348,6 +864,7 @@ def _build_telegram_bot() -> TelegramBot:
             resume=_telegram_resume_text,
             run_cycle=_telegram_run_cycle_text,
             export_csv=_telegram_export_result,
+            history=_telegram_history_text,
         )
     )
 
@@ -358,10 +875,12 @@ def create_health_app():
         import time as time_module
 
         import httpx
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Request
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import JSONResponse
         from starlette.responses import Response
+
+        from app.config_api import router as config_router
 
         app = FastAPI(title="SubnetTrader EMA", docs_url=None, redoc_url=None)
         app.add_middleware(
@@ -370,20 +889,175 @@ def create_health_app():
             allow_methods=["*"],
             allow_headers=["*"],
         )
+        app.include_router(config_router)
 
         @app.get("/health")
         async def health():
             data: dict[str, object] = {
-                "status": "ok" if ema_portfolio else "initializing",
+                "status": "ok" if (ema_meanrev or ema_trend or ema_flow) else "initializing",
                 "timestamp": utc_iso(),
-                "ema_enabled": settings.EMA_ENABLED,
-                "ema_dry_run": settings.EMA_DRY_RUN,
+                "meanrev_enabled": settings.MR_ENABLED,
+                "trend_enabled": settings.EMA_B_ENABLED,
+                "flow_enabled": settings.FLOW_ENABLED,
                 "kill_switch_active": os.path.exists(settings.KILL_SWITCH_PATH),
             }
-            if ema_portfolio and taostats:
+            if taostats:
                 alpha_prices = await taostats.get_alpha_prices()
-                data["portfolio"] = ema_portfolio.get_portfolio_summary(alpha_prices)
+                if ema_meanrev:
+                    data["meanrev"] = ema_meanrev.get_portfolio_summary(alpha_prices)
+                if ema_trend:
+                    data["trend"] = ema_trend.get_portfolio_summary(alpha_prices)
+                if ema_flow:
+                    data["flow"] = ema_flow.get_portfolio_summary(alpha_prices)
             return JSONResponse(content=data)
+
+        @app.get("/api/health/services")
+        async def api_health_services():
+            results = {}
+            ts = utc_iso()
+
+            # 1. Taostats
+            try:
+                taostats_key = settings.TAOSTATS_API_KEY or ""
+                headers = {"Authorization": taostats_key} if taostats_key else {}
+                t0 = time_module.monotonic()
+                async with httpx.AsyncClient(timeout=10) as client:
+                    r = await client.get(
+                        "https://api.taostats.io/api/dtao/pool/latest/v1?limit=1",
+                        headers=headers,
+                    )
+                latency = int((time_module.monotonic() - t0) * 1000)
+                results["taostats"] = {
+                    "ok": r.status_code == 200,
+                    "name": "Taostats API",
+                    "detail": "200 OK" if r.status_code == 200
+                        else f"HTTP {r.status_code}",
+                    "last_check": ts,
+                    "latency_ms": latency,
+                }
+            except Exception as exc:
+                results["taostats"] = {
+                    "ok": False,
+                    "name": "Taostats API",
+                    "detail": str(exc),
+                    "last_check": ts,
+                }
+
+            # 3. Telegram
+            tg_token = settings.TELEGRAM_BOT_TOKEN
+            tg_chat = settings.TELEGRAM_CHAT_ID
+            if tg_token and tg_chat:
+                try:
+                    t0 = time_module.monotonic()
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        r = await client.get(f"https://api.telegram.org/bot{tg_token}/getMe")
+                    latency = int((time_module.monotonic() - t0) * 1000)
+                    if r.status_code == 200:
+                        bot_info = r.json().get("result", {})
+                        bot_name = bot_info.get("username", "unknown")
+                        results["telegram"] = {
+                            "ok": True,
+                            "name": "Telegram Bot",
+                            "detail": f"Bot @{bot_name} responding",
+                            "last_check": ts,
+                            "latency_ms": latency,
+                        }
+                    else:
+                        results["telegram"] = {
+                            "ok": False,
+                            "name": "Telegram Bot",
+                            "detail": f"HTTP {r.status_code} — invalid token",
+                            "last_check": ts,
+                        }
+                except Exception as exc:
+                    results["telegram"] = {
+                        "ok": False,
+                        "name": "Telegram Bot",
+                        "detail": str(exc),
+                        "last_check": ts,
+                    }
+            else:
+                results["telegram"] = {
+                    "ok": False,
+                    "name": "Telegram Bot",
+                    "detail": "Not configured"
+                        + (" (missing token)" if not tg_token else "")
+                        + (" (missing chat ID)" if not tg_chat else ""),
+                    "last_check": ts,
+                }
+
+            # 4. Database
+            try:
+                if db:
+                    count = await db.fetchone("SELECT COUNT(*) as n FROM ema_positions")
+                    trade_count = count["n"] if count else 0
+                    results["database"] = {
+                        "ok": True,
+                        "name": "SQLite Database",
+                        "detail": f"WAL mode, {trade_count} trades",
+                        "last_check": ts,
+                    }
+                else:
+                    results["database"] = {
+                        "ok": False,
+                        "name": "SQLite Database",
+                        "detail": "Not initialized",
+                        "last_check": ts,
+                    }
+            except Exception as exc:
+                results["database"] = {
+                    "ok": False,
+                    "name": "SQLite Database",
+                    "detail": str(exc),
+                    "last_check": ts,
+                }
+
+            # 5. Wallet
+            try:
+                if executor:
+                    balance = await executor.get_tao_balance()
+                    live_pots = compute_pots(balance, settings)
+                    if all(v < 0 for v in live_pots.values()):
+                        live_pots = {
+                            "meanrev": ema_meanrev._cfg.pot_tao if ema_meanrev else 0.0,
+                            "trend": ema_trend._cfg.pot_tao if ema_trend else 0.0,
+                            "flow": ema_flow._cfg.pot_tao if ema_flow else 0.0,
+                        }
+                    pot = sum(live_pots.values())
+                    kill_switch = os.path.exists(settings.KILL_SWITCH_PATH)
+                    meanrev_breaker = ema_meanrev.is_breaker_active if ema_meanrev else False
+                    trend_breaker = ema_trend.is_breaker_active if ema_trend else False
+                    flow_breaker = ema_flow.is_breaker_active if ema_flow else False
+                    can_trade = (
+                        not kill_switch
+                        and not (meanrev_breaker or trend_breaker or flow_breaker)
+                        and (settings.MR_ENABLED or not settings.EMA_B_DRY_RUN)
+                    )
+                    results["wallet"] = {
+                        "ok": True,
+                        "name": "Wallet",
+                        "detail": f"{settings.BT_WALLET_NAME} — {balance:.4f} TAO",
+                        "can_trade": can_trade,
+                        "balance_tao": round(balance, 4),
+                        "pot_tao": pot,
+                        "last_check": ts,
+                    }
+                else:
+                    results["wallet"] = {
+                        "ok": False,
+                        "name": "Wallet",
+                        "detail": "Executor not initialized",
+                        "last_check": ts,
+                    }
+            except Exception as exc:
+                results["wallet"] = {
+                    "ok": False,
+                    "name": "Wallet",
+                    "detail": f"Balance check failed: {exc}",
+                    "last_check": ts,
+                }
+
+            return JSONResponse(content={"timestamp": ts, "services": results})
 
         @app.get("/api/control/status")
         async def api_control_status():
@@ -393,20 +1067,26 @@ def create_health_app():
                 if job and job.next_run_time:
                     next_run = job.next_run_time.isoformat()
 
-            summary = None
-            if ema_portfolio and taostats:
-                alpha_prices = await taostats.get_alpha_prices()
-                summary = ema_portfolio.get_portfolio_summary(alpha_prices)
+            alpha_prices = await taostats.get_alpha_prices() if taostats else {}
+            meanrev_summary = ema_meanrev.get_portfolio_summary(alpha_prices) if ema_meanrev else None
+            trend_summary = ema_trend.get_portfolio_summary(alpha_prices) if ema_trend else None
+            flow_summary = ema_flow.get_portfolio_summary(alpha_prices) if ema_flow else None
 
             return JSONResponse(
                 content={
                     "kill_switch_active": os.path.exists(settings.KILL_SWITCH_PATH),
                     "scheduler_running": scheduler.running if scheduler else False,
                     "next_cycle": next_run,
-                    "ema_enabled": settings.EMA_ENABLED,
-                    "ema_dry_run": settings.EMA_DRY_RUN,
+                    "meanrev_enabled": settings.MR_ENABLED,
+                    "meanrev_dry_run": False,
+                    "trend_enabled": settings.EMA_B_ENABLED,
+                    "trend_dry_run": settings.EMA_B_DRY_RUN,
+                    "flow_enabled": settings.FLOW_ENABLED,
+                    "flow_dry_run": settings.FLOW_DRY_RUN,
                     "exit_watcher_enabled": settings.EMA_EXIT_WATCHER_ENABLED,
-                    "breaker_active": summary["breaker_active"] if summary else False,
+                    "meanrev_breaker_active": meanrev_summary["breaker_active"] if meanrev_summary else False,
+                    "trend_breaker_active": trend_summary["breaker_active"] if trend_summary else False,
+                    "flow_breaker_active": flow_summary["breaker_active"] if flow_summary else False,
                 }
             )
 
@@ -424,70 +1104,108 @@ def create_health_app():
 
         @app.post("/api/control/run-ema-cycle")
         async def api_run_ema_cycle():
-            if ema_portfolio is None:
-                raise HTTPException(status_code=503, detail="EMA not initialized")
+            if ema_meanrev is None and ema_trend is None and ema_flow is None:
+                raise HTTPException(status_code=503, detail="No strategy initialized")
             asyncio.create_task(run_ema_cycle())
             return JSONResponse(content={"triggered": True})
 
         @app.post("/api/control/reset-dry-run")
         async def api_reset_dry_run():
-            if not settings.EMA_DRY_RUN:
-                raise HTTPException(status_code=403, detail="Reset only allowed in EMA_DRY_RUN mode")
+            if settings.MR_ENABLED or not settings.EMA_B_DRY_RUN:
+                raise HTTPException(status_code=403, detail="Reset only allowed in DRY_RUN mode")
             if db is None:
                 raise HTTPException(status_code=503, detail="DB not initialized")
 
             await db.clear_ema_history()
-            if ema_portfolio:
-                await ema_portfolio.initialize()
+            if ema_meanrev:
+                await ema_meanrev.initialize()
+            if ema_trend:
+                await ema_trend.initialize()
 
             logger.info("EMA dry-run data reset via control panel")
             return JSONResponse(content={"reset": True})
 
         @app.get("/api/ema/portfolio")
         async def api_ema_portfolio():
-            if ema_portfolio is None:
-                return JSONResponse(content={"enabled": False})
-
             alpha_prices = await taostats.get_alpha_prices() if taostats else {}
-            summary = ema_portfolio.get_portfolio_summary(alpha_prices)
             snapshot = taostats._pool_snapshot if taostats else {}
+            # Refresh pot sizing so summary reflects current mode/wallet state.
+            try:
+                await _apply_pot_sizing()
+            except Exception as exc:
+                logger.debug(f"Pot sizing refresh skipped: {exc}")
+            result: dict = {}
 
-            for pos in summary["open_positions"]:
-                pos["name"] = snapshot.get(pos["netuid"], {}).get("name", "") or f"SN{pos['netuid']}"
-
-            summary["enabled"] = True
-            summary["ema_period"] = settings.EMA_PERIOD
-            summary["confirm_bars"] = settings.EMA_CONFIRM_BARS
-            summary["dry_run"] = settings.EMA_DRY_RUN
-            summary["signal_timeframe_hours"] = settings.EMA_CANDLE_TIMEFRAME_HOURS
-            summary["stop_loss_pct"] = settings.EMA_STOP_LOSS_PCT
-            summary["take_profit_pct"] = settings.EMA_TAKE_PROFIT_PCT
-            summary["trailing_stop_pct"] = 10.0
-            summary["exit_watcher"] = {
-                "enabled": settings.EMA_EXIT_WATCHER_ENABLED,
-                "interval_sec": settings.EMA_EXIT_WATCHER_SEC,
-                "last_run": _ema_exit_watch_status["last_run"],
-                "last_error": _ema_exit_watch_status["last_error"],
-                "last_exit_count": _ema_exit_watch_status["last_exit_count"],
-            }
+            for key, mgr, exit_status in [
+                ("meanrev", ema_meanrev, _meanrev_exit_watch_status),
+                ("trend", ema_trend, _trend_exit_watch_status),
+                ("flow", ema_flow, _flow_exit_watch_status),
+            ]:
+                if mgr is None:
+                    result[key] = {"enabled": False}
+                    continue
+                summary = mgr.get_portfolio_summary(alpha_prices)
+                for pos in summary["open_positions"]:
+                    pos["name"] = snapshot.get(pos["netuid"], {}).get("name", "") or f"SN{pos['netuid']}"
+                summary["enabled"] = True
+                summary["dry_run"] = mgr._cfg.dry_run
+                summary["confirm_bars"] = mgr._cfg.confirm_bars
+                summary["signal_timeframe_hours"] = mgr._cfg.candle_timeframe_hours
+                summary["stop_loss_pct"] = mgr._cfg.stop_loss_pct
+                summary["take_profit_pct"] = mgr._cfg.take_profit_pct
+                summary["trailing_stop_pct"] = mgr._cfg.trailing_stop_pct
+                summary["exit_watcher"] = {
+                    "enabled": settings.EMA_EXIT_WATCHER_ENABLED,
+                    "interval_sec": settings.EMA_EXIT_WATCHER_SEC,
+                    **exit_status,
+                }
+                result[key] = summary
 
             try:
-                summary["wallet_balance"] = round(await executor.get_tao_balance(), 6) if executor else None
+                wallet_balance = round(await executor.get_tao_balance(), 6) if executor else None
             except Exception:
-                summary["wallet_balance"] = None
+                wallet_balance = None
 
-            return JSONResponse(content=summary)
+            s = result.get("meanrev", {})
+            t = result.get("trend", {})
+            f = result.get("flow", {})
+            result["combined"] = {
+                "total_pot": (s.get("pot_tao") or 0) + (t.get("pot_tao") or 0) + (f.get("pot_tao") or 0),
+                "total_deployed": (s.get("deployed_tao") or 0) + (t.get("deployed_tao") or 0) + (f.get("deployed_tao") or 0),
+                "total_open": (s.get("open_count") or 0) + (t.get("open_count") or 0) + (f.get("open_count") or 0),
+                "wallet_balance": wallet_balance,
+                "pot_mode": settings.EMA_POT_MODE,
+                "fee_reserve_tao": settings.EMA_FEE_RESERVE_TAO,
+                "pot_weights": {
+                    "meanrev": settings.EMA_MEANREV_WEIGHT,
+                    "trend": settings.EMA_TREND_WEIGHT,
+                    "flow": settings.EMA_FLOW_WEIGHT,
+                },
+            }
+
+            return JSONResponse(content=result)
 
         @app.get("/api/ema/positions")
-        async def api_ema_positions(limit: int = 200):
+        async def api_ema_positions(limit: int = 200, strategy: str | None = None):
             if db is None:
                 raise HTTPException(status_code=503, detail="DB not initialized")
 
-            rows = await db.get_ema_positions(limit=limit)
+            rows = await db.get_ema_positions(limit=limit, strategy=strategy)
             snapshot = taostats._pool_snapshot if taostats else {}
             for row in rows:
                 row["name"] = snapshot.get(row["netuid"], {}).get("name", "") or f"SN{row['netuid']}"
             return JSONResponse(content={"positions": rows})
+
+        @app.get("/api/ema/recent-trades")
+        async def api_ema_recent_trades(limit: int = 5, strategy: str | None = None):
+            if db is None:
+                raise HTTPException(status_code=503, detail="DB not initialized")
+
+            rows = await db.get_closed_ema_positions(limit=limit, strategy=strategy)
+            snapshot = taostats._pool_snapshot if taostats else {}
+            for row in rows:
+                row["name"] = snapshot.get(row["netuid"], {}).get("name", "") or f"SN{row['netuid']}"
+            return JSONResponse(content={"trades": rows})
 
         @app.get("/api/ema/signals")
         async def api_ema_signals():
@@ -499,11 +1217,127 @@ def create_health_app():
 
             from app.strategy.ema_signals import (
                 bars_above_below_ema,
+                build_sampled_candles,
                 compute_ema,
+                compute_mtf_signal,
                 dual_ema_signal,
             )
+            from app.strategy.indicators import (
+                compute_bollinger_bands,
+                compute_macd,
+                compute_rsi,
+            )
+            from app.strategy.mean_reversion import meanrev_entry_signal
+            from app.utils.math import rolling_volatility
+
+            # Use trend params as the primary signal display (EMA-based)
+            primary = ema_trend or ema_meanrev
+            fast_p = primary._cfg.fast_period if primary else 3
+            slow_p = primary._cfg.slow_period if primary else 9
+            confirm = primary._cfg.confirm_bars if primary else 3
+            mtf_enabled = primary._cfg.mtf_enabled if primary else False
+            mtf_lower_tf = primary._cfg.mtf_lower_tf_hours if primary else 1
+            mtf_confirm = primary._cfg.mtf_confirm_bars if primary else 3
+
+            # Collect open position netuids so they are always included
+            open_netuids: set[int] = set()
+            for mgr in [ema_meanrev, ema_trend]:
+                if mgr is not None:
+                    for p in mgr.get_portfolio_summary(alpha_prices).get("open_positions", []):
+                        open_netuids.add(p["netuid"])
+
+            def _build_signal(netuid: int, snap_data: dict) -> dict | None:
+                cur = alpha_prices.get(netuid, 0.0)
+                if cur <= 0:
+                    return None
+                seven_day = snap_data.get("seven_day_prices", [])
+                prices = [float(entry["price"]) for entry in seven_day if entry.get("price")]
+                if not prices:
+                    return None
+                ema_vals = compute_ema(prices, slow_p)
+                fast_ema_vals = compute_ema(prices, fast_p)
+                sig_data: dict = {
+                    "netuid": netuid,
+                    "name": snap_data.get("name", "") or f"SN{netuid}",
+                    "price": cur,
+                    "ema": round(ema_vals[-1], 8) if ema_vals else 0.0,
+                    "fast_ema": round(fast_ema_vals[-1], 8) if fast_ema_vals else 0.0,
+                    "signal": dual_ema_signal(prices, fast_p, slow_p, confirm),
+                    "bars": bars_above_below_ema(prices, slow_p),
+                    "prices": [round(p, 8) for p in prices],
+                    "ema_values": [round(v, 8) for v in ema_vals],
+                    "fast_ema_values": [round(v, 8) for v in fast_ema_vals],
+                }
+                # Add per-strategy signals if both strategies are active
+                if ema_meanrev and ema_trend:
+                    sig_data["signal_meanrev"] = (
+                        "BUY" if meanrev_entry_signal(
+                            prices,
+                            rsi_threshold=ema_meanrev._cfg.rsi_oversold,
+                            rsi_period=ema_meanrev._cfg.rsi_period,
+                            bb_period=ema_meanrev._cfg.bb_period,
+                            bb_std=ema_meanrev._cfg.bb_std,
+                        ) else "HOLD"
+                    )
+                    sig_data["signal_trend"] = dual_ema_signal(
+                        prices, ema_trend._cfg.fast_period,
+                        ema_trend._cfg.slow_period, ema_trend._cfg.confirm_bars,
+                    )
+                # Multi-timeframe confirmation
+                if mtf_enabled:
+                    lower_candles = build_sampled_candles(seven_day, timeframe_hours=mtf_lower_tf)
+                    mtf = compute_mtf_signal(lower_candles, fast_p, slow_p, mtf_confirm)
+                    sig_data["mtf_lower_tf_hours"] = mtf_lower_tf
+                    sig_data["lower_tf_ema_fast"] = mtf["lower_tf_ema_fast"]
+                    sig_data["lower_tf_ema_slow"] = mtf["lower_tf_ema_slow"]
+                    sig_data["lower_tf_bars_above"] = mtf["lower_tf_bars_above"]
+                    sig_data["mtf_confirmed"] = mtf["lower_tf_bullish"]
+                    # Per-strategy MTF if trend is active (MTF doesn't apply to mean-reversion)
+                    if ema_trend and ema_trend._cfg.mtf_enabled:
+                        lc = build_sampled_candles(seven_day, timeframe_hours=ema_trend._cfg.mtf_lower_tf_hours)
+                        m = compute_mtf_signal(lc, ema_trend._cfg.fast_period, ema_trend._cfg.slow_period, ema_trend._cfg.mtf_confirm_bars)
+                        sig_data["mtf_trend"] = m["lower_tf_bullish"]
+                # Volatility-based sizing info
+                vol_cfg = primary._cfg if primary else None
+                if vol_cfg and vol_cfg.vol_sizing_enabled:
+                    vol = rolling_volatility(prices, window=vol_cfg.vol_window)
+                    sig_data["ann_volatility"] = round(vol, 4) if vol is not None else None
+                    if vol is not None:
+                        vol_clamped = max(vol_cfg.vol_floor, min(vol, vol_cfg.vol_cap))
+                        vol_pct = vol_cfg.vol_target_risk / vol_clamped
+                        vol_pct = max(vol_cfg.vol_min_size_pct, min(vol_pct, vol_cfg.vol_max_size_pct))
+                        sig_data["vol_adjusted_size_pct"] = round(vol_pct, 4)
+                        # Pool-depth size for comparison
+                        tao_in_pool = float(snap_data.get("total_tao", 0) or 0) / 1e9
+                        if tao_in_pool > 0:
+                            depth_pct = round((tao_in_pool * 0.025) / vol_cfg.pot_tao, 4)
+                        else:
+                            depth_pct = round(vol_cfg.position_size_pct, 4)
+                        sig_data["pool_depth_size_pct"] = depth_pct
+                        sig_data["final_size_pct"] = round(min(vol_pct, depth_pct), 4)
+                    else:
+                        sig_data["vol_adjusted_size_pct"] = None
+                        sig_data["pool_depth_size_pct"] = None
+                        sig_data["final_size_pct"] = None
+                # Technical indicators (RSI, MACD, Bollinger Bands)
+                if len(prices) >= 2:
+                    rsi = compute_rsi(prices)
+                    sig_data["rsi"] = round(rsi[-1], 1)
+                    _, _, histogram = compute_macd(prices)
+                    sig_data["macd_histogram"] = round(histogram[-1], 6)
+                    bb_upper, bb_middle, bb_lower = compute_bollinger_bands(prices)
+                    bb_range = bb_upper[-1] - bb_lower[-1]
+                    sig_data["bb_position"] = round(
+                        (prices[-1] - bb_lower[-1]) / bb_range if bb_range > 0 else 0.5, 2
+                    )
+                else:
+                    sig_data["rsi"] = None
+                    sig_data["macd_histogram"] = None
+                    sig_data["bb_position"] = None
+                return sig_data
 
             results = []
+            included_netuids: set[int] = set()
             ranked_snapshot = sorted(
                 snapshot.items(),
                 key=lambda item: float(item[1].get("tao_in_pool", 0) or 0),
@@ -512,87 +1346,276 @@ def create_health_app():
             for netuid, snap_data in ranked_snapshot:
                 if netuid == 0:
                     continue
-                cur = alpha_prices.get(netuid, 0.0)
-                if cur <= 0:
-                    continue
+                sig = _build_signal(netuid, snap_data)
+                if sig is not None:
+                    results.append(sig)
+                    included_netuids.add(netuid)
 
-                seven_day = snap_data.get("seven_day_prices", [])
-                prices = [float(entry["price"]) for entry in seven_day if entry.get("price")]
-                if not prices:
-                    continue
+            # Ensure open positions are always included
+            for netuid in open_netuids - included_netuids:
+                snap_data = snapshot.get(netuid, {})
+                sig = _build_signal(netuid, snap_data)
+                if sig is not None:
+                    results.append(sig)
 
-                ema_vals = compute_ema(prices, settings.EMA_PERIOD)
-                fast_ema_vals = compute_ema(prices, settings.EMA_FAST_PERIOD)
-                results.append(
-                    {
-                        "netuid": netuid,
-                        "name": snap_data.get("name", "") or f"SN{netuid}",
-                        "price": cur,
-                        "ema": round(ema_vals[-1], 8) if ema_vals else 0.0,
-                        "fast_ema": round(fast_ema_vals[-1], 8) if fast_ema_vals else 0.0,
-                        "signal": dual_ema_signal(
-                            prices,
-                            settings.EMA_FAST_PERIOD,
-                            settings.EMA_PERIOD,
-                            settings.EMA_CONFIRM_BARS,
-                        ),
-                        "bars": bars_above_below_ema(prices, settings.EMA_PERIOD),
-                    }
-                )
+            strategies = []
+            if ema_meanrev:
+                strategies.append({"tag": "meanrev", "fast": ema_meanrev._cfg.fast_period, "slow": ema_meanrev._cfg.slow_period})
+            if ema_trend:
+                strategies.append({"tag": "trend", "fast": ema_trend._cfg.fast_period, "slow": ema_trend._cfg.slow_period})
 
             return JSONResponse(
                 content={
-                    "signals": results[:60],
-                    "ema_period": settings.EMA_PERIOD,
-                    "fast_ema_period": settings.EMA_FAST_PERIOD,
+                    "signals": results[:120],
+                    "ema_period": slow_p,
+                    "fast_ema_period": fast_p,
+                    "strategies": strategies,
+                    "mtf_enabled": mtf_enabled,
+                    "mtf_lower_tf_hours": mtf_lower_tf,
                 }
             )
 
         @app.post("/api/ema/positions/{position_id}/close")
         async def api_ema_close(position_id: int):
-            if ema_portfolio is None:
-                raise HTTPException(status_code=503, detail="EMA not initialized")
-
-            result = await ema_portfolio.manual_close(position_id)
-            if result is None:
-                raise HTTPException(status_code=404, detail="EMA position not found")
+            # Determine which manager owns this position
+            if db is None:
+                raise HTTPException(status_code=503, detail="DB not initialized")
+            row = await db.fetchone(
+                "SELECT strategy FROM ema_positions WHERE id = ? AND status = 'OPEN'",
+                (position_id,),
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="Position not found")
+            mgr = {
+                "meanrev": ema_meanrev,
+                "trend": ema_trend,
+                "flow": ema_flow,
+            }.get(row["strategy"])
+            if mgr is None:
+                raise HTTPException(status_code=503, detail="Strategy manager not initialized")
+            try:
+                result = await mgr.manual_close(position_id)
+            except ValueError as e:
+                raise HTTPException(status_code=404, detail=str(e))
+            except RuntimeError as e:
+                raise HTTPException(status_code=409, detail=str(e))
             return JSONResponse(content={"success": True, "result": result})
+
+        @app.get("/api/regime")
+        async def api_regime():
+            if regime_filter is None:
+                return JSONResponse(
+                    content={
+                        "enabled": settings.REGIME_ENABLED,
+                        "regime": "UNKNOWN",
+                        "since": None,
+                        "metrics": {},
+                        "gates": {},
+                    }
+                )
+            try:
+                await regime_filter.refresh()
+            except Exception as exc:
+                logger.debug(f"Regime refresh (API) skipped: {exc}")
+            gates = regime_filter.gates_map()
+            entries_allowed = [k for k, v in gates.items() if v]
+            entries_blocked = [k for k, v in gates.items() if not v]
+            return JSONResponse(
+                content={
+                    "enabled": regime_filter.enabled,
+                    "regime": regime_filter.current_regime,
+                    "since": regime_filter.regime_since,
+                    "metrics": regime_filter.metrics,
+                    "gates": gates,
+                    "entries_allowed": entries_allowed,
+                    "entries_blocked": entries_blocked,
+                    "raw_regime": regime_filter.classify(),
+                }
+            )
+
+        @app.get("/api/ema/stuck-positions")
+        async def api_ema_stuck_positions():
+            stuck: list[dict] = []
+            for mgr in [ema_meanrev, ema_trend, ema_flow]:
+                if mgr is not None:
+                    for info in mgr._stuck_positions.values():
+                        stuck.append({**info, "strategy": mgr._cfg.tag})
+            return JSONResponse(content={"stuck": stuck, "count": len(stuck)})
+
+        @app.get("/api/flow/portfolio")
+        async def api_flow_portfolio():
+            if ema_flow is None:
+                return JSONResponse(content={"enabled": False})
+            alpha_prices = await taostats.get_alpha_prices() if taostats else {}
+            snapshot = taostats._pool_snapshot if taostats else {}
+            summary = ema_flow.get_portfolio_summary(alpha_prices)
+            for pos in summary["open_positions"]:
+                pos["name"] = snapshot.get(pos["netuid"], {}).get("name", "") or f"SN{pos['netuid']}"
+            summary["enabled"] = True
+            summary["dry_run"] = ema_flow._cfg.dry_run
+            summary["stop_loss_pct"] = ema_flow._cfg.stop_loss_pct
+            summary["take_profit_pct"] = ema_flow._cfg.take_profit_pct
+            summary["trailing_stop_pct"] = ema_flow._cfg.trailing_stop_pct
+            summary["z_entry"] = settings.FLOW_Z_ENTRY
+            summary["z_exit"] = settings.FLOW_Z_EXIT
+            summary["min_tao_pct"] = settings.FLOW_MIN_TAO_PCT
+            summary["magnitude_cap"] = settings.FLOW_MAGNITUDE_CAP
+            summary["regime_threshold"] = settings.FLOW_REGIME_INDEX_THRESHOLD
+            summary["snapshot_status"] = _flow_snapshot_status
+            summary["exit_watcher"] = {
+                "enabled": settings.EMA_EXIT_WATCHER_ENABLED,
+                "interval_sec": settings.EMA_EXIT_WATCHER_SEC,
+                **_flow_exit_watch_status,
+            }
+            try:
+                wallet_balance = round(await executor.get_tao_balance(), 6) if executor else None
+            except Exception:
+                wallet_balance = None
+            summary["wallet_balance"] = wallet_balance
+            return JSONResponse(content=summary)
+
+        @app.get("/api/flow/positions")
+        async def api_flow_positions(limit: int = 200):
+            if db is None:
+                raise HTTPException(status_code=503, detail="DB not initialized")
+            rows = await db.get_ema_positions(limit=limit, strategy=settings.FLOW_STRATEGY_TAG)
+            snapshot = taostats._pool_snapshot if taostats else {}
+            for row in rows:
+                row["name"] = snapshot.get(row["netuid"], {}).get("name", "") or f"SN{row['netuid']}"
+            return JSONResponse(content={"positions": rows})
+
+        @app.get("/api/flow/signals")
+        async def api_flow_signals():
+            if ema_flow is None or taostats is None or db is None:
+                return JSONResponse(content={"signals": []})
+            from app.strategy.flow_signals import (
+                compute_flow_delta_pct,
+                emission_adjusted_flow,
+            )
+            snapshot = taostats._pool_snapshot
+            cfg = ema_flow._flow_signal_cfg()
+            ranked = sorted(
+                snapshot.items(),
+                key=lambda item: float(item[1].get("tao_in_pool", 0) or 0),
+                reverse=True,
+            )[:80]
+            results: list[dict] = []
+            for netuid, snap_data in ranked:
+                if netuid == 0:
+                    continue
+                snaps = await db.get_pool_snapshots(netuid=netuid)
+                if not snaps:
+                    continue
+                count = len(snaps)
+                tao_1h = compute_flow_delta_pct(snaps, cfg.window_1h_snaps)
+                tao_4h = compute_flow_delta_pct(snaps, cfg.window_4h_snaps)
+                alpha_4h = compute_flow_delta_pct(
+                    snaps, cfg.window_4h_snaps, field="alpha_in_pool"
+                )
+                adj = emission_adjusted_flow(
+                    snaps, cfg.window_4h_snaps,
+                    sold_fraction=cfg.sold_fraction if cfg.emission_adjust else 0.0,
+                )
+                eval_result = None
+                if count >= cfg.cold_start_snaps:
+                    eval_result = await ema_flow._evaluate_flow_entry(netuid, prices=[])
+                results.append({
+                    "netuid": int(netuid),
+                    "name": snap_data.get("name", "") or f"SN{netuid}",
+                    "price": float(snap_data.get("price", 0) or 0),
+                    "tao_in_pool": float(snap_data.get("total_tao", 0) or 0) / 1e9,
+                    "snapshots": count,
+                    "tao_delta_pct_1h": tao_1h,
+                    "tao_delta_pct_4h": tao_4h,
+                    "alpha_delta_pct_4h": alpha_4h,
+                    "adj_flow_4h": adj,
+                    "signal": eval_result.signal if eval_result else "BLOCKED-cold_start",
+                    "reason": eval_result.reason if eval_result else f"need {cfg.cold_start_snaps} snaps, have {count}",
+                    "z_score": eval_result.z_score if eval_result else None,
+                    "magnitude_capped": eval_result.magnitude_capped if eval_result else False,
+                })
+            return JSONResponse(
+                content={
+                    "signals": results,
+                    "z_entry": cfg.z_entry,
+                    "z_exit": cfg.z_exit,
+                    "min_tao_pct": cfg.min_tao_pct,
+                    "cold_start_snaps": cfg.cold_start_snaps,
+                    "magnitude_cap": cfg.magnitude_cap,
+                }
+            )
+
+        @app.post("/api/flow/positions/{position_id}/close")
+        async def api_flow_close(position_id: int):
+            if ema_flow is None:
+                raise HTTPException(status_code=503, detail="Flow strategy not enabled")
+            try:
+                result = await ema_flow.manual_close(position_id)
+            except ValueError as e:
+                raise HTTPException(status_code=404, detail=str(e))
+            except RuntimeError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            return JSONResponse(content={"success": True, "result": result})
+
+        @app.get("/api/flow/snapshots")
+        async def api_flow_snapshots(netuid: int, limit: int = 500):
+            if db is None:
+                raise HTTPException(status_code=503, detail="DB not initialized")
+            rows = await db.get_pool_snapshots(netuid=netuid, limit=limit)
+            return JSONResponse(
+                content={
+                    "netuid": netuid,
+                    "count": len(rows),
+                    "snapshots": rows,
+                }
+            )
 
         @app.get("/api/ema/slippage-stats")
         async def api_ema_slippage_stats():
             if db is None:
                 raise HTTPException(status_code=503, detail="DB not initialized")
 
-            rows = await db.fetchall(
+            # Averages computed from CLOSED positions only (matches QA DB aggregate)
+            closed_rows = await db.fetchall(
                 """
                 SELECT netuid, entry_slippage_pct, exit_slippage_pct, amount_tao
                 FROM ema_positions
-                WHERE status = 'CLOSED' AND entry_slippage_pct IS NOT NULL
+                WHERE status = 'CLOSED'
                 ORDER BY exit_ts DESC
-                LIMIT 100
                 """
             )
-            if not rows:
+            # Total slippage computed from ALL positions (matches QA test which iterates db_all)
+            all_rows = await db.fetchall(
+                """
+                SELECT netuid, entry_slippage_pct, exit_slippage_pct, amount_tao
+                FROM ema_positions
+                """
+            )
+
+            if not closed_rows and not all_rows:
                 return JSONResponse(content={"trade_count": 0})
 
-            entry_slips = [row["entry_slippage_pct"] for row in rows if row["entry_slippage_pct"] is not None]
-            exit_slips = [row["exit_slippage_pct"] for row in rows if row["exit_slippage_pct"] is not None]
+            entry_slips = [row["entry_slippage_pct"] for row in closed_rows if row["entry_slippage_pct"] is not None]
+            exit_slips = [row["exit_slippage_pct"] for row in closed_rows if row["exit_slippage_pct"] is not None]
             avg_entry = sum(entry_slips) / len(entry_slips) if entry_slips else 0.0
             avg_exit = sum(exit_slips) / len(exit_slips) if exit_slips else 0.0
 
             combined = []
             total_slip_tao = 0.0
-            for row in rows:
+            for row in closed_rows:
                 entry_slip = row["entry_slippage_pct"] or 0.0
                 exit_slip = row["exit_slippage_pct"] or 0.0
                 combined_slip = entry_slip + exit_slip
                 combined.append((combined_slip, row["netuid"]))
-                total_slip_tao += row["amount_tao"] * combined_slip / 100.0
+            for row in all_rows:
+                entry_slip = row["entry_slippage_pct"] or 0.0
+                exit_slip = row["exit_slippage_pct"] or 0.0
+                total_slip_tao += (row["amount_tao"] or 0.0) * (entry_slip + exit_slip) / 100.0
 
             combined.sort()
             return JSONResponse(
                 content={
-                    "trade_count": len(rows),
+                    "trade_count": len(closed_rows),
                     "avg_entry_slippage_pct": round(avg_entry, 3),
                     "avg_exit_slippage_pct": round(avg_exit, 3),
                     "avg_round_trip_pct": round(avg_entry + avg_exit, 3),
@@ -711,6 +1734,67 @@ def create_health_app():
                 headers={"Content-Disposition": "attachment; filename=ema_trades.csv"},
             )
 
+        # ── SSE live price feed ─────────────────────────────────────
+        import json as _json
+
+        _sse_connections = 0
+
+        @app.get("/api/prices")
+        async def price_stream(request: Request):
+            nonlocal _sse_connections
+
+            if _sse_connections >= settings.PRICE_FEED_MAX_CONNECTIONS:
+                return JSONResponse(
+                    {"error": "too many price stream connections"}, status_code=503
+                )
+
+            async def event_generator():
+                nonlocal _sse_connections
+                _sse_connections += 1
+                try:
+                    while True:
+                        if await request.is_disconnected():
+                            break
+                        snapshot = taostats._pool_snapshot if taostats else {}
+                        payload = {
+                            int(netuid): {
+                                "price": float(snap.get("price", 0) or 0),
+                                "tao_in_pool": float(snap.get("total_tao", 0) or 0) / 1e9,
+                                "alpha_in_pool": float(snap.get("alpha_in_pool", 0) or 0) / 1e9,
+                            }
+                            for netuid, snap in snapshot.items()
+                        }
+                        data = _json.dumps({"ts": utc_iso(), "prices": payload})
+                        yield f"data: {data}\n\n"
+
+                        # Wait for snapshot refresh or timeout
+                        if taostats:
+                            try:
+                                await asyncio.wait_for(
+                                    taostats._price_updated.wait(),
+                                    timeout=settings.PRICE_FEED_INTERVAL_SEC,
+                                )
+                                taostats._price_updated.clear()
+                            except asyncio.TimeoutError:
+                                pass
+                        else:
+                            await asyncio.sleep(settings.PRICE_FEED_INTERVAL_SEC)
+                finally:
+                    _sse_connections -= 1
+
+            from starlette.responses import StreamingResponse
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
         return app
     except ImportError:
         return None
@@ -784,17 +1868,38 @@ async def main() -> None:
         if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
             telegram_bot = _build_telegram_bot()
             telegram_task = asyncio.create_task(telegram_bot.run(_shutdown_event))
+            mode_a = "LIVE" if settings.MR_ENABLED else "OFF"
+            mode_b = "LIVE" if not settings.EMA_B_DRY_RUN else "DRY"
             await send_alert(
                 f"🤖 <b>EMA bot online</b>\n"
-                f"Mode: {'LIVE' if not settings.EMA_DRY_RUN else 'DRY RUN'}\n"
-                f"Scan interval: {settings.SCAN_INTERVAL_MIN}m\n"
+                f"Mean-Reversion (RSI{settings.MR_RSI_PERIOD}/BB{settings.MR_BB_PERIOD}): {mode_a}\n"
+                f"Trend {settings.EMA_B_FAST_PERIOD}/{settings.EMA_B_PERIOD}: {mode_b}\n"
+                f"Scan: {settings.SCAN_INTERVAL_MIN}m\n"
                 f"Commands: <code>/help</code>"
             )
 
-        if settings.EMA_ENABLED:
+        # R3: Detect dual-held subnets at startup and warn
+        if ema_meanrev and ema_trend:
+            dual = await _detect_dual_held_netuids()
+            if dual:
+                msg = (
+                    f"⚠️ <b>Dual-held subnets at startup</b>\n"
+                    f"Both Mean-Reversion and Trend hold: {sorted(dual)}\n"
+                    f"Trend exit watcher will defer exits on these to avoid double-dumping.\n"
+                    f"Use <code>/close</code> to manually close the worse position."
+                )
+                logger.warning(msg)
+                await send_alert(msg)
+
+        if settings.MR_ENABLED or settings.EMA_B_ENABLED or settings.FLOW_ENABLED:
             await run_ema_cycle()
             if settings.EMA_EXIT_WATCHER_ENABLED:
-                await run_ema_exit_watch()
+                if ema_meanrev:
+                    await run_meanrev_exit_watch()
+                if ema_trend:
+                    await run_trend_exit_watch()
+                if ema_flow:
+                    await run_flow_exit_watch()
 
         await _shutdown_event.wait()
     except KeyboardInterrupt:

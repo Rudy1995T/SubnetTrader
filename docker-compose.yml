@@ -1,11 +1,10 @@
-version: "3.9"
-
 services:
-  subnet-trader:
+  backend:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: subnet-trader
+      target: backend
+    container_name: subnettrader-backend
     restart: unless-stopped
     env_file:
       - .env
@@ -14,16 +13,17 @@ services:
       - ./data:/app/data
       # Mount wallet directory (read-only for safety)
       - ${BT_WALLET_PATH:-~/.bittensor/wallets}:/home/trader/.bittensor/wallets:ro
-      # Kill switch – touch ./KILL_SWITCH to halt
+      # Kill switch
       - .:/app/host:ro
     environment:
       - KILL_SWITCH_PATH=/app/host/KILL_SWITCH
       - DB_PATH=/app/data/ledger.db
       - JSONL_DIR=/app/data/logs
+      - HEALTH_PORT=8081
     ports:
-      - "${HEALTH_PORT:-8080}:8080"
+      - "8081:8081"
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; r = httpx.get('http://localhost:8080/health'); r.raise_for_status()"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8081/health"]
       interval: 60s
       timeout: 10s
       retries: 3
@@ -33,3 +33,23 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: frontend
+    container_name: subnettrader-frontend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8081
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

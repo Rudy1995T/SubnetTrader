@@ -14,6 +14,7 @@ env/
 
 # Data (keep structure, ignore contents)
 data/ledger.db
+data/subnet_trader.db
 data/bot.log
 data/logs/
 data/exports/
@@ -31,6 +32,11 @@ KILL_SWITCH
 # OS
 .DS_Store
 Thumbs.db
+
+# Frontend build artifacts
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+frontend/node_modules/
 
 # Testing
 .pytest_cache/

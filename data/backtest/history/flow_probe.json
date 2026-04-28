@@ -1,0 +1,337 @@
+{
+  "probed_at": "2026-04-21T13:10:17.295941+00:00",
+  "probe_netuid": 1,
+  "per_interval": [
+    {
+      "interval": "5m",
+      "rows_returned": 10,
+      "observed_seconds": 86400.0,
+      "requested_seconds": 300,
+      "supported": false,
+      "sample": {
+        "netuid": 1,
+        "block_number": 8017120,
+        "timestamp": "2026-04-21T13:08:36Z",
+        "name": "",
+        "symbol": "\u03b1",
+        "market_cap": "46371716033221.70824002",
+        "liquidity": "58654183072353",
+        "total_tao": "29326337770300",
+        "total_alpha": "4804778652425899",
+        "alpha_in_pool": "2692463330697325",
+        "alpha_staked": "1564724461827461",
+        "price": "0.01089257",
+        "root_prop": "0.16494277928804449166",
+        "rank": 22,
+        "startup_mode": false,
+        "protocol_provided_tao": "29326337770300",
+        "user_provided_tao": "0",
+        "protocol_provided_alpha": "2692463330697325",
+        "user_provided_alpha": "0",
+        "enabled_user_liquidity": false,
+        "swap_v3_initialized": true,
+        "alpha_sqrt_price": null,
+        "liquidity_raw": "280879457352135",
+        "current_tick": -45200,
+        "fee_global_alpha": "0.01476313249646225292",
+        "fee_global_tao": "0.0002035828436432063",
+        "fee_rate": "0.00050354772259098192"
+      },
+      "raw_samples": [
+        {
+          "timestamp": "2026-04-21T13:08:36Z",
+          "block_number": 8017120,
+          "price": "0.01089257"
+        },
+        {
+          "timestamp": "2026-04-20T23:59:48Z",
+          "block_number": 8013179,
+          "price": "0.011047039"
+        },
+        {
+          "timestamp": "2026-04-19T23:59:48Z",
+          "block_number": 8005979,
+          "price": "0.010911549"
+        },
+        {
+          "timestamp": "2026-04-18T23:59:48Z",
+          "block_number": 7998779,
+          "price": "0.010851988"
+        },
+        {
+          "timestamp": "2026-04-17T23:59:48Z",
+          "block_number": 7991579,
+          "price": "0.010733284"
+        }
+      ]
+    },
+    {
+      "interval": "15m",
+      "rows_returned": 10,
+      "observed_seconds": 86400.0,
+      "requested_seconds": 900,
+      "supported": false,
+      "sample": {
+        "netuid": 1,
+        "block_number": 8017121,
+        "timestamp": "2026-04-21T13:08:48.001Z",
+        "name": "",
+        "symbol": "\u03b1",
+        "market_cap": "46371746677107.590003184",
+        "liquidity": "58654201919594",
+        "total_tao": "29326347813110",
+        "total_alpha": "4804778729870505",
+        "alpha_in_pool": "2692462408710514",
+        "alpha_staked": "1564725461258878",
+        "price": "0.010892577",
+        "root_prop": "0.16494277706797112213",
+        "rank": 22,
+        "startup_mode": false,
+        "protocol_provided_tao": "29326347813110",
+        "user_provided_tao": "0",
+        "protocol_provided_alpha": "2692462408710514",
+        "user_provided_alpha": "0",
+        "enabled_user_liquidity": false,
+        "swap_v3_initialized": true,
+        "alpha_sqrt_price": null,
+        "liquidity_raw": "280879457352135",
+        "current_tick": -45199,
+        "fee_global_alpha": "0.01476313249646225292",
+        "fee_global_tao": "0.0002035828436432063",
+        "fee_rate": "0.00050354772259098192"
+      },
+      "raw_samples": [
+        {
+          "timestamp": "2026-04-21T13:08:48.001Z",
+          "block_number": 8017121,
+          "price": "0.010892577"
+        },
+        {
+          "timestamp": "2026-04-20T23:59:48Z",
+          "block_number": 8013179,
+          "price": "0.011047039"
+        },
+        {
+          "timestamp": "2026-04-19T23:59:48Z",
+          "block_number": 8005979,
+          "price": "0.010911549"
+        },
+        {
+          "timestamp": "2026-04-18T23:59:48Z",
+          "block_number": 7998779,
+          "price": "0.010851988"
+        },
+        {
+          "timestamp": "2026-04-17T23:59:48Z",
+          "block_number": 7991579,
+          "price": "0.010733284"
+        }
+      ]
+    },
+    {
+      "interval": "1h",
+      "rows_returned": 10,
+      "observed_seconds": 86400.0,
+      "requested_seconds": 3600,
+      "supported": false,
+      "sample": {
+        "netuid": 1,
+        "block_number": 8017121,
+        "timestamp": "2026-04-21T13:08:48.001Z",
+        "name": "",
+        "symbol": "\u03b1",
+        "market_cap": "46371746677107.590003184",
+        "liquidity": "58654201919594",
+        "total_tao": "29326347813110",
+        "total_alpha": "4804778729870505",
+        "alpha_in_pool": "2692462408710514",
+        "alpha_staked": "1564725461258878",
+        "price": "0.010892577",
+        "root_prop": "0.16494277706797112213",
+        "rank": 22,
+        "startup_mode": false,
+        "protocol_provided_tao": "29326347813110",
+        "user_provided_tao": "0",
+        "protocol_provided_alpha": "2692462408710514",
+        "user_provided_alpha": "0",
+        "enabled_user_liquidity": false,
+        "swap_v3_initialized": true,
+        "alpha_sqrt_price": null,
+        "liquidity_raw": "280879457352135",
+        "current_tick": -45199,
+        "fee_global_alpha": "0.01476313249646225292",
+        "fee_global_tao": "0.0002035828436432063",
+        "fee_rate": "0.00050354772259098192"
+      },
+      "raw_samples": [
+        {
+          "timestamp": "2026-04-21T13:08:48.001Z",
+          "block_number": 8017121,
+          "price": "0.010892577"
+        },
+        {
+          "timestamp": "2026-04-20T23:59:48Z",
+          "block_number": 8013179,
+          "price": "0.011047039"
+        },
+        {
+          "timestamp": "2026-04-19T23:59:48Z",
+          "block_number": 8005979,
+          "price": "0.010911549"
+        },
+        {
+          "timestamp": "2026-04-18T23:59:48Z",
+          "block_number": 7998779,
+          "price": "0.010851988"
+        },
+        {
+          "timestamp": "2026-04-17T23:59:48Z",
+          "block_number": 7991579,
+          "price": "0.010733284"
+        }
+      ]
+    },
+    {
+      "interval": "4h",
+      "rows_returned": 10,
+      "observed_seconds": 86400.0,
+      "requested_seconds": 14400,
+      "supported": false,
+      "sample": {
+        "netuid": 1,
+        "block_number": 8017121,
+        "timestamp": "2026-04-21T13:08:48.001Z",
+        "name": "",
+        "symbol": "\u03b1",
+        "market_cap": "46371746677107.590003184",
+        "liquidity": "58654201919594",
+        "total_tao": "29326347813110",
+        "total_alpha": "4804778729870505",
+        "alpha_in_pool": "2692462408710514",
+        "alpha_staked": "1564725461258878",
+        "price": "0.010892577",
+        "root_prop": "0.16494277706797112213",
+        "rank": 22,
+        "startup_mode": false,
+        "protocol_provided_tao": "29326347813110",
+        "user_provided_tao": "0",
+        "protocol_provided_alpha": "2692462408710514",
+        "user_provided_alpha": "0",
+        "enabled_user_liquidity": false,
+        "swap_v3_initialized": true,
+        "alpha_sqrt_price": null,
+        "liquidity_raw": "280879457352135",
+        "current_tick": -45199,
+        "fee_global_alpha": "0.01476313249646225292",
+        "fee_global_tao": "0.0002035828436432063",
+        "fee_rate": "0.00050354772259098192"
+      },
+      "raw_samples": [
+        {
+          "timestamp": "2026-04-21T13:08:48.001Z",
+          "block_number": 8017121,
+          "price": "0.010892577"
+        },
+        {
+          "timestamp": "2026-04-20T23:59:48Z",
+          "block_number": 8013179,
+          "price": "0.011047039"
+        },
+        {
+          "timestamp": "2026-04-19T23:59:48Z",
+          "block_number": 8005979,
+          "price": "0.010911549"
+        },
+        {
+          "timestamp": "2026-04-18T23:59:48Z",
+          "block_number": 7998779,
+          "price": "0.010851988"
+        },
+        {
+          "timestamp": "2026-04-17T23:59:48Z",
+          "block_number": 7991579,
+          "price": "0.010733284"
+        }
+      ]
+    },
+    {
+      "interval": "1d",
+      "rows_returned": 10,
+      "observed_seconds": 86400.0,
+      "requested_seconds": 86400,
+      "supported": true,
+      "sample": {
+        "netuid": 1,
+        "block_number": 8017121,
+        "timestamp": "2026-04-21T13:08:48.001Z",
+        "name": "",
+        "symbol": "\u03b1",
+        "market_cap": "46371746677107.590003184",
+        "liquidity": "58654201919594",
+        "total_tao": "29326347813110",
+        "total_alpha": "4804778729870505",
+        "alpha_in_pool": "2692462408710514",
+        "alpha_staked": "1564725461258878",
+        "price": "0.010892577",
+        "root_prop": "0.16494277706797112213",
+        "rank": 22,
+        "startup_mode": false,
+        "protocol_provided_tao": "29326347813110",
+        "user_provided_tao": "0",
+        "protocol_provided_alpha": "2692462408710514",
+        "user_provided_alpha": "0",
+        "enabled_user_liquidity": false,
+        "swap_v3_initialized": true,
+        "alpha_sqrt_price": null,
+        "liquidity_raw": "280879457352135",
+        "current_tick": -45199,
+        "fee_global_alpha": "0.01476313249646225292",
+        "fee_global_tao": "0.0002035828436432063",
+        "fee_rate": "0.00050354772259098192"
+      },
+      "raw_samples": [
+        {
+          "timestamp": "2026-04-21T13:08:48.001Z",
+          "block_number": 8017121,
+          "price": "0.010892577"
+        },
+        {
+          "timestamp": "2026-04-20T23:59:48Z",
+          "block_number": 8013179,
+          "price": "0.011047039"
+        },
+        {
+          "timestamp": "2026-04-19T23:59:48Z",
+          "block_number": 8005979,
+          "price": "0.010911549"
+        },
+        {
+          "timestamp": "2026-04-18T23:59:48Z",
+          "block_number": 7998779,
+          "price": "0.010851988"
+        },
+        {
+          "timestamp": "2026-04-17T23:59:48Z",
+          "block_number": 7991579,
+          "price": "0.010733284"
+        }
+      ]
+    }
+  ],
+  "intervals_supported": [
+    "1d"
+  ],
+  "finest_interval": "1d",
+  "max_history_days_per_netuid": 198.5,
+  "emission_rate_present": false,
+  "sample_record": null,
+  "second_ts_by_interval": {
+    "5m": "2026-04-20T23:59:48Z",
+    "15m": "2026-04-20T23:59:48Z",
+    "1h": "2026-04-20T23:59:48Z",
+    "4h": "2026-04-20T23:59:48Z",
+    "1d": "2026-04-20T23:59:48Z"
+  },
+  "cadence_collapsed_to_1d": true,
+  "note": "Taostats /api/dtao/pool/history/v1 ignores the `interval` parameter and returns daily rows. Only `1d` is honest. See specs/fix-deep-history-resolution-mismatch.md."
+}

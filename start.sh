@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "[1/5] Stopping any running processes..."
-kill $(lsof -ti:8080) 2>/dev/null && echo "  ✓ Stopped backend (port 8080)" || echo "  – Backend was not running"
+kill $(lsof -ti:8081) 2>/dev/null && echo "  ✓ Stopped backend (port 8081)" || echo "  – Backend was not running"
 fuser -k 3000/tcp 2>/dev/null && echo "  ✓ Stopped frontend (port 3000)" || echo "  – Frontend was not running"
 sleep 1
 
@@ -20,7 +20,7 @@ echo "  ✓ Backend started (PID $BACKEND_PID)"
 
 echo "[3/5] Waiting for backend to be ready..."
 for i in $(seq 1 15); do
-  if curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health | grep -q "200"; then
+  if curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/health | grep -q "200"; then
     echo "  ✓ Backend ready"
     break
   fi
@@ -30,22 +30,29 @@ for i in $(seq 1 15); do
   fi
 done
 
-echo "[4/5] Cleaning stale frontend cache..."
-fuser -k 3000/tcp 2>/dev/null; sleep 1
-rm -rf frontend/.next
-echo "  ✓ .next cache cleared"
-
-echo "[5/5] Starting frontend..."
+echo "[4/5] Ensuring frontend production build..."
+fuser -k 3000/tcp 2>/dev/null || true; sleep 1
 cd frontend
-nohup npm run dev >> /tmp/frontend.log 2>&1 &
+if [ ! -d ".next" ] || [ -n "$REBUILD_FRONTEND" ]; then
+  echo "  • Building frontend (npm run build)..."
+  npm run build >> /tmp/frontend-build.log 2>&1
+  echo "  ✓ Build complete (log: /tmp/frontend-build.log)"
+else
+  echo "  ✓ .next/ exists — skipping build (set REBUILD_FRONTEND=1 to force)"
+fi
+cd "$SCRIPT_DIR"
+
+echo "[5/5] Starting frontend (production)..."
+cd frontend
+nohup npm run start -- -p 3000 >> /tmp/frontend.log 2>&1 &
 FRONTEND_PID=$!
 cd "$SCRIPT_DIR"
-echo "  ✓ Frontend started (PID $FRONTEND_PID) — first page load will take ~10s to compile"
+echo "  ✓ Frontend started (PID $FRONTEND_PID) — production server, no HMR"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  SubnetTrader is running"
-echo "  Backend:  http://localhost:8080"
+echo "  Backend:  http://localhost:8081"
 echo "  Frontend: http://localhost:3000"
 echo "  Bot logs: tail -f data/bot.log"
 echo "  UI logs:  tail -f /tmp/frontend.log"
